@@ -21,6 +21,8 @@ from aiogram.types import (
     Message,
 )
 
+from bot.config import Settings
+from bot.services.access import AccessManager
 from bot.services.cache import CachedMedia, MediaCache
 from bot.services.downloader import (
     AuthRequiredError,
@@ -31,7 +33,7 @@ from bot.services.downloader import (
     YouTubeDownloader,
 )
 from bot.services.instagram import InstagramDownloader
-from bot.services.jobs import PendingJob, PendingJobStore
+from bot.services.jobs import PendingJob, PendingJobStore, RateLimiter
 from bot.services.tiktok import TikTokDownloader
 from bot.utils.parsers import (
     TimeRange,
@@ -413,6 +415,29 @@ def _is_group_trigger(message: Message) -> bool:
     return _has_dl_command(message)
 
 
+def check_group_duration_limit(
+    duration_seconds: float | int | None,
+    time_range: TimeRange | None,
+    *,
+    is_live: bool = False,
+    max_duration_seconds: int = 120,
+) -> str | None:
+    """Return a rejection message if a group request is a live stream or exceeds max_duration_seconds."""
+    if is_live:
+        return "⛔ Прямые трансляции в групповых чатах не скачиваются."
+    if max_duration_seconds <= 0:
+        return None
+
+    effective = time_range.duration_seconds if time_range is not None else duration_seconds
+    if effective is not None and effective > max_duration_seconds:
+        return (
+            f"⏱ Видео слишком длинное для группового чата ({format_duration(effective)}).\n"
+            f"В группах ограничение до {format_duration(max_duration_seconds)} "
+            "(отправь ссылку мне в личку или укажи короткий таймкод)."
+        )
+    return None
+
+
 @router.message(
     F.chat.type.in_({ChatType.GROUP, ChatType.SUPERGROUP}),
     F.func(_is_group_trigger),
@@ -426,6 +451,9 @@ async def handle_group_shorts(
     media_cache: MediaCache,
     job_store: PendingJobStore,
     bot_username: str = "",
+    settings: Settings | None = None,
+    access_manager: AccessManager | None = None,
+    rate_limiter: RateLimiter | None = None,
 ) -> None:
     """Download media in authorized group chats (/dl, reply-to-bot, @mention, or auto Shorts/Reels/TikTok)."""
     own_text = _get_message_text(message)
@@ -484,6 +512,11 @@ async def handle_group_shorts(
     else:
         return
 
+    max_group_dur = settings.group_max_duration_seconds if settings else 120
+    max_group_bytes = settings.group_max_file_size_bytes if settings else 150 * 1024 * 1024
+    sender_id = message.from_user.id if message.from_user else 0
+    sender_is_admin = bool(access_manager and sender_id and access_manager.is_admin(sender_id))
+
     status_msg = await message.reply(f"⏳ Скачиваю {label}...")
     media: DownloadedMedia | None = None
     try:
@@ -512,6 +545,19 @@ async def handle_group_shorts(
                     time_range=validated_range,
                 ):
                     return
+
+                if dur_err := check_group_duration_limit(
+                    None, validated_range, max_duration_seconds=max_group_dur
+                ):
+                    await _safe_edit(status_msg, dur_err)
+                    return
+
+                if rate_limiter is not None and sender_id:
+                    if limit_err := rate_limiter.check_and_record(
+                        sender_id, is_admin=sender_is_admin
+                    ):
+                        await _safe_edit(status_msg, limit_err)
+                        return
 
                 media = await ig_downloader.download(
                     shortcode=ig_parsed.media.shortcode,
@@ -546,6 +592,22 @@ async def handle_group_shorts(
                     time_range=validated_range,
                 ):
                     return
+
+                if dur_err := check_group_duration_limit(
+                    info.duration,
+                    validated_range,
+                    is_live=info.is_live,
+                    max_duration_seconds=max_group_dur,
+                ):
+                    await _safe_edit(status_msg, dur_err)
+                    return
+
+                if rate_limiter is not None and sender_id:
+                    if limit_err := rate_limiter.check_and_record(
+                        sender_id, is_admin=sender_is_admin
+                    ):
+                        await _safe_edit(status_msg, limit_err)
+                        return
 
                 media = await tiktok_downloader.download(
                     info.webpage_url,
@@ -583,6 +645,22 @@ async def handle_group_shorts(
                 ):
                     return
 
+                if dur_err := check_group_duration_limit(
+                    info.duration,
+                    validated_range,
+                    is_live=info.is_live,
+                    max_duration_seconds=max_group_dur,
+                ):
+                    await _safe_edit(status_msg, dur_err)
+                    return
+
+                if rate_limiter is not None and sender_id:
+                    if limit_err := rate_limiter.check_and_record(
+                        sender_id, is_admin=sender_is_admin
+                    ):
+                        await _safe_edit(status_msg, limit_err)
+                        return
+
                 media = await downloader.download(
                     info.webpage_url,
                     quality="best",
@@ -593,6 +671,20 @@ async def handle_group_shorts(
                 )
                 title = info.title
                 uploader = info.uploader
+
+        if dur_err := check_group_duration_limit(
+            media.duration, validated_range, max_duration_seconds=max_group_dur
+        ):
+            await _safe_edit(status_msg, dur_err)
+            return
+
+        if max_group_bytes > 0 and media.size_bytes > max_group_bytes:
+            await _safe_edit(
+                status_msg,
+                f"📦 Видео ({format_filesize(media.size_bytes)}) превышает лимит для групповых чатов "
+                f"({format_filesize(max_group_bytes)}). Отправь ссылку мне в личку.",
+            )
+            return
 
         caption = f"{badge} <b>{html.escape(title)}</b>"
         if validated_range:
@@ -967,6 +1059,8 @@ async def cb_download(
     tiktok_downloader: TikTokDownloader,
     media_cache: MediaCache,
     job_store: PendingJobStore,
+    access_manager: AccessManager | None = None,
+    rate_limiter: RateLimiter | None = None,
 ) -> None:
     parts = (callback.data or "").split(":")
     if len(parts) != 3:
@@ -1056,6 +1150,12 @@ async def cb_download(
                 pass
             return
         media_cache.delete(cache_key)
+
+    if rate_limiter is not None:
+        is_admin = bool(access_manager and access_manager.is_admin(callback.from_user.id))
+        if limit_err := rate_limiter.check_and_record(callback.from_user.id, is_admin=is_admin):
+            await _safe_edit(status_msg, f"{header}\n\n{limit_err}")
+            return
 
     media = None
     try:

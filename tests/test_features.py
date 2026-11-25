@@ -6,12 +6,19 @@ from aiogram.enums import ChatType
 from aiogram.types import Chat, ChatMemberUpdated, Message, MessageEntity, User
 
 from bot.handlers.commands import cmd_start, on_added_to_group
-from bot.handlers.youtube import _has_supported_media_url, _is_group_auto_media, is_bot_mentioned
+from bot.handlers.youtube import (
+    _has_supported_media_url,
+    _is_group_auto_media,
+    check_group_duration_limit,
+    is_bot_mentioned,
+)
 from bot.main import cleanup_stale_downloads
 from bot.services.access import AccessManager
 from bot.services.alerts import AdminAlertMonitor
 from bot.services.cache import CachedMedia, MediaCache
 from bot.services.chrome_cookies import SessionStatus
+from bot.services.downloader import AuthRequiredError, YouTubeDownloader
+from bot.services.jobs import RateLimiter
 from bot.services.tiktok import parse_tikwm_payload
 from bot.utils.parsers import TimeRange, extract_tiktok_url, parse_tiktok_request
 
@@ -280,3 +287,77 @@ async def test_separate_help_for_private_and_group(tmp_path: Path) -> None:
     pm_help = pm_msg.answer.call_args.args[0]
     assert "личных сообщениях" in pm_help
     assert "Админ-команды" in pm_help
+
+
+def test_rate_limiter_and_group_duration_limits() -> None:
+    limiter = RateLimiter(cooldown_seconds=20, hourly_limit=2)
+    # Admins are exempt
+    assert limiter.check_and_record(1, is_admin=True) is None
+    assert limiter.check_and_record(1, is_admin=True) is None
+
+    # Non-admin hits cooldown immediately after 1st download
+    assert limiter.check_and_record(2, is_admin=False) is None
+    cooldown_msg = limiter.check_and_record(2, is_admin=False)
+    assert cooldown_msg is not None and "Подожди" in cooldown_msg
+
+    # Hourly quota test (cooldown=0)
+    q_limiter = RateLimiter(cooldown_seconds=0, hourly_limit=2)
+    assert q_limiter.check_and_record(3, is_admin=False) is None
+    assert q_limiter.check_and_record(3, is_admin=False) is None
+    quota_msg = q_limiter.check_and_record(3, is_admin=False)
+    assert quota_msg is not None and "часовой лимит" in quota_msg
+
+    # Group duration limits (120s max, no live streams)
+    assert check_group_duration_limit(120, None, max_duration_seconds=120) is None
+    assert check_group_duration_limit(121, None, max_duration_seconds=120) is not None
+    assert check_group_duration_limit(600, TimeRange(10.0, 70.0), max_duration_seconds=120) is None
+    assert check_group_duration_limit(600, TimeRange(0.0, 150.0), max_duration_seconds=120) is not None
+    assert check_group_duration_limit(30, None, is_live=True, max_duration_seconds=120) is not None
+
+
+async def test_anonymous_first_then_cookies_fallback(tmp_path: Path) -> None:
+    cookie_mgr = MagicMock()
+    cookie_mgr.get_cookies_snapshot = AsyncMock(
+        side_effect=lambda dest: (dest.write_text("# Netscape\n"), dest)[1]
+    )
+    cookie_mgr.refresh_cookies = AsyncMock()
+
+    dl = YouTubeDownloader(
+        downloads_dir=tmp_path,
+        cookie_manager=cookie_mgr,
+        pot_provider_url="http://bgutil-pot-provider:4416",
+        sleep_requests=1.0,
+        concurrent_fragments=2,
+    )
+
+    # Check yt-dlp args without cookies vs with cookies
+    anon_args = dl._base_ytdlp_args(None)
+    assert "--cookies" not in anon_args
+    assert "youtubepot-bgutilhttp:base_url=http://bgutil-pot-provider:4416" in anon_args
+    assert "--sleep-requests" in anon_args
+    assert "--concurrent-fragments" in anon_args
+
+    # 1. Anonymous succeeds -> cookies are NOT touched
+    calls: list[Path | None] = []
+
+    async def _anon_ok(cp: Path | None) -> str:
+        calls.append(cp)
+        return "ok"
+
+    assert await dl._with_anonymous_then_cookies(_anon_ok) == "ok"
+    assert calls == [None]
+    cookie_mgr.get_cookies_snapshot.assert_not_awaited()
+
+    # 2. Anonymous fails with AuthRequiredError -> falls back to cookies
+    calls.clear()
+
+    async def _needs_cookies(cp: Path | None) -> str:
+        calls.append(cp)
+        if cp is None:
+            raise AuthRequiredError("Sign in to confirm you're not a bot")
+        return "ok_with_cookies"
+
+    assert await dl._with_anonymous_then_cookies(_needs_cookies) == "ok_with_cookies"
+    assert len(calls) == 2
+    assert calls[0] is None and calls[1] is not None
+    cookie_mgr.get_cookies_snapshot.assert_awaited_once()

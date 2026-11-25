@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import secrets
 import time
+from collections import defaultdict, deque
 from dataclasses import dataclass, field
 
 from bot.services.downloader import VideoInfo
@@ -22,6 +23,38 @@ class PendingJob:
     time_range: TimeRange | None = None
     as_document: bool = False
     created_at: float = field(default_factory=time.monotonic)
+
+
+class RateLimiter:
+    """Per-user cooldown and hourly download quota for non-admin users."""
+
+    def __init__(self, *, cooldown_seconds: int = 20, hourly_limit: int = 20) -> None:
+        self.cooldown_seconds = max(0, cooldown_seconds)
+        self.hourly_limit = max(0, hourly_limit)
+        self._history: dict[int, deque[float]] = defaultdict(deque)
+
+    def check_and_record(self, user_id: int, *, is_admin: bool = False) -> str | None:
+        """Return None and record usage if allowed; otherwise return a user-facing limit message."""
+        if is_admin:
+            return None
+
+        now = time.monotonic()
+        bucket = self._history[user_id]
+        cutoff = now - 3600.0
+        while bucket and bucket[0] < cutoff:
+            bucket.popleft()
+
+        if self.cooldown_seconds > 0 and bucket:
+            elapsed = now - bucket[-1]
+            if elapsed < self.cooldown_seconds:
+                wait_sec = max(1, int(round(self.cooldown_seconds - elapsed)))
+                return f"⏳ Слишком часто! Подожди {wait_sec} сек. перед следующим скачиванием."
+
+        if self.hourly_limit > 0 and len(bucket) >= self.hourly_limit:
+            return f"⏳ Достигнут часовой лимит скачиваний ({self.hourly_limit} в час). Попробуй позже."
+
+        bucket.append(now)
+        return None
 
 
 class PendingJobStore:

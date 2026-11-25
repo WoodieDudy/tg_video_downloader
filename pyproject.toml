@@ -8,6 +8,7 @@ dependencies = [
     "pydantic-settings>=2.5,<3.0",
     "playwright>=1.49,<2.0",
     "yt-dlp[default]",
+    "bgutil-ytdlp-pot-provider",
 ]
 
 [project.optional-dependencies]

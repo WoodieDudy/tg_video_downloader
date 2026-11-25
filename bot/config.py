@@ -62,12 +62,19 @@ class Settings(BaseSettings):
     users_file: Path = Path("/data/state/users.json")
     cache_file: Path = Path("/data/state/media_cache.json")
 
-    cookie_refresh_interval_minutes: int = 30
+    cookie_refresh_interval_minutes: int = 240
     low_disk_warn_gb: float = 3.0
     alert_cooldown_minutes: int = 360
     max_concurrent_downloads: int = 2
     max_file_size_mb: int = 2000
+    group_max_duration_seconds: int = 120
+    group_max_file_size_mb: int = 150
+    user_cooldown_seconds: int = 20
+    user_hourly_limit: int = 20
     ytdlp_js_runtime: str = "deno"
+    pot_provider_url: str | None = None
+    ytdlp_sleep_requests: float = 1.0
+    ytdlp_concurrent_fragments: int = 2
     video_crf: int = 24
     video_preset: str = "medium"
     bot_api_timeout_seconds: int = 1800
@@ -80,6 +87,10 @@ class Settings(BaseSettings):
     @property
     def max_file_size_bytes(self) -> int:
         return self.max_file_size_mb * 1024 * 1024
+
+    @property
+    def group_max_file_size_bytes(self) -> int:
+        return self.group_max_file_size_mb * 1024 * 1024
 
 
 def load_settings() -> Settings:

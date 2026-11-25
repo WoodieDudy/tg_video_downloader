@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 import shutil
+import time
 import uuid
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
@@ -380,8 +381,17 @@ def summarize_video_formats(
     return available, estimates, is_portrait
 
 
+@dataclass(slots=True)
+class _InfoCacheEntry:
+    raw_json: dict[str, Any]
+    used_cookies: bool
+    created_at: float
+
+
 class YouTubeDownloader:
-    """Wrapper around yt-dlp and ffprobe with automatic Chrome cookie refresh."""
+    """Wrapper around yt-dlp and ffprobe with PO Token, anonymous-first, and Chrome cookie fallback."""
+
+    _INFO_CACHE_TTL_SECONDS = 900.0
 
     def __init__(
         self,
@@ -390,6 +400,9 @@ class YouTubeDownloader:
         *,
         max_file_size_bytes: int = 2000 * 1024 * 1024,
         js_runtime: str = "deno",
+        pot_provider_url: str | None = None,
+        sleep_requests: float = 1.0,
+        concurrent_fragments: int = 2,
         video_crf: int = 24,
         video_preset: str = "medium",
     ) -> None:
@@ -397,13 +410,17 @@ class YouTubeDownloader:
         self.cookie_manager = cookie_manager
         self.max_file_size_bytes = max_file_size_bytes
         self.js_runtime = js_runtime
+        self.pot_provider_url = pot_provider_url.rstrip("/") if pot_provider_url else None
+        self.sleep_requests = sleep_requests
+        self.concurrent_fragments = concurrent_fragments
         self.video_crf = video_crf
         self.video_preset = video_preset
+        self._info_cache: dict[str, _InfoCacheEntry] = {}
         self.downloads_dir.mkdir(parents=True, exist_ok=True)
 
     async def fetch_info(self, url: str, *, is_shorts: bool = False) -> VideoInfo:
-        """Fetch YouTube video metadata without downloading the media."""
-        return await self._with_cookie_retry(
+        """Fetch YouTube video metadata (anonymously first with PO Token, cookies as fallback)."""
+        return await self._with_anonymous_then_cookies(
             lambda cookies_path: self._fetch_info_once(
                 url, cookies_path=cookies_path, is_shorts=is_shorts
             )
@@ -420,8 +437,42 @@ class YouTubeDownloader:
         on_progress: ProgressCallback | None = None,
         on_stage: StageCallback | None = None,
     ) -> DownloadedMedia:
-        """Download video or audio, optionally trimmed by time_range and compressed for Telegram."""
-        return await self._with_cookie_retry(
+        """Download video or audio, reusing cached info.json when available to cut YouTube requests in half."""
+        cached = self._pop_fresh_info_cache(url)
+        if cached is not None:
+            try:
+                if cached.used_cookies:
+                    return await self._with_cookie_retry(
+                        lambda cp: self._download_once(
+                            url,
+                            quality=quality,
+                            is_portrait=is_portrait,
+                            time_range=time_range,
+                            compress=compress,
+                            cookies_path=cp,
+                            info_json=cached.raw_json,
+                            on_progress=on_progress,
+                            on_stage=on_stage,
+                        )
+                    )
+                return await self._download_once(
+                    url,
+                    quality=quality,
+                    is_portrait=is_portrait,
+                    time_range=time_range,
+                    compress=compress,
+                    cookies_path=None,
+                    info_json=cached.raw_json,
+                    on_progress=on_progress,
+                    on_stage=on_stage,
+                )
+            except (AuthRequiredError, DownloadError) as exc:
+                logger.warning(
+                    "Download via cached info.json failed (%s); falling back to fresh fetch.",
+                    exc,
+                )
+
+        return await self._with_anonymous_then_cookies(
             lambda cookies_path: self._download_once(
                 url,
                 quality=quality,
@@ -429,10 +480,35 @@ class YouTubeDownloader:
                 time_range=time_range,
                 compress=compress,
                 cookies_path=cookies_path,
+                info_json=None,
                 on_progress=on_progress,
                 on_stage=on_stage,
             )
         )
+
+    async def _with_anonymous_then_cookies(
+        self, operation: Callable[[Path | None], Awaitable[Any]]
+    ) -> Any:
+        """Try anonymous yt-dlp (+ PO Token) first; use Chrome cookies only if YouTube requires auth."""
+        try:
+            return await operation(None)
+        except AuthRequiredError as anon_err:
+            logger.info(
+                "Anonymous YouTube request hit auth/bot gate (%s); retrying with Chrome cookies.",
+                anon_err,
+            )
+            return await self._with_cookie_retry(operation)
+
+    def _pop_fresh_info_cache(self, url: str) -> _InfoCacheEntry | None:
+        now = time.monotonic()
+        expired = [
+            k
+            for k, v in self._info_cache.items()
+            if now - v.created_at > self._INFO_CACHE_TTL_SECONDS
+        ]
+        for k in expired:
+            self._info_cache.pop(k, None)
+        return self._info_cache.pop(url, None)
 
     async def _with_cookie_retry(self, operation: Callable[[Path | None], Awaitable[Any]]) -> Any:
         tmp_cookie_dir = self.downloads_dir / f".cookies-{uuid.uuid4().hex}"
@@ -471,6 +547,17 @@ class YouTubeDownloader:
         ]
         if self.js_runtime:
             args.extend(["--js-runtimes", self.js_runtime])
+        if self.pot_provider_url:
+            args.extend(
+                [
+                    "--extractor-args",
+                    f"youtubepot-bgutilhttp:base_url={self.pot_provider_url}",
+                ]
+            )
+        if self.sleep_requests > 0:
+            args.extend(["--sleep-requests", str(self.sleep_requests)])
+        if self.concurrent_fragments > 0:
+            args.extend(["--concurrent-fragments", str(self.concurrent_fragments)])
         if cookies_path is not None and cookies_path.exists():
             args.extend(["--cookies", str(cookies_path)])
         return args
@@ -507,14 +594,26 @@ class YouTubeDownloader:
 
         formats = data.get("formats") or []
         available_heights, estimated_sizes, is_portrait = summarize_video_formats(formats)
+        webpage_url = str(data.get("webpage_url") or url)
+
+        entry = _InfoCacheEntry(
+            raw_json=data,
+            used_cookies=cookies_path is not None,
+            created_at=time.monotonic(),
+        )
+        self._info_cache[webpage_url] = entry
+        self._info_cache[url] = entry
+        if len(self._info_cache) > 100:
+            oldest_key = next(iter(self._info_cache))
+            self._info_cache.pop(oldest_key, None)
 
         return VideoInfo(
             video_id=str(data.get("id", "")),
             title=str(data.get("title") or "YouTube Video"),
             uploader=str(data.get("uploader") or data.get("channel") or "YouTube"),
             duration=data.get("duration"),
-            webpage_url=str(data.get("webpage_url") or url),
-            is_shorts=is_shorts or "/shorts/" in str(data.get("webpage_url", "")),
+            webpage_url=webpage_url,
+            is_shorts=is_shorts or "/shorts/" in webpage_url,
             is_portrait=is_portrait,
             is_live=bool(data.get("is_live", False)),
             available_heights=available_heights,
@@ -530,6 +629,7 @@ class YouTubeDownloader:
         time_range: TimeRange | None,
         compress: bool,
         cookies_path: Path | None,
+        info_json: dict[str, Any] | None = None,
         on_progress: ProgressCallback | None,
         on_stage: StageCallback | None,
     ) -> DownloadedMedia:
@@ -595,7 +695,12 @@ class YouTubeDownloader:
                     ]
                 )
 
-            cmd.append(url)
+            if info_json is not None:
+                info_path = job_dir / "info.json"
+                info_path.write_text(json.dumps(info_json), encoding="utf-8")
+                cmd.extend(["--load-info-json", str(info_path)])
+            else:
+                cmd.append(url)
             logger.info("Running yt-dlp: %s", " ".join(cmd))
 
             proc = await asyncio.create_subprocess_exec(
@@ -676,7 +781,7 @@ class YouTubeDownloader:
         candidates = [
             p
             for p in job_dir.iterdir()
-            if p.is_file() and not p.name.endswith((".part", ".ytdl", ".tmp"))
+            if p.is_file() and not p.name.endswith((".part", ".ytdl", ".tmp", ".json"))
         ]
         if not candidates:
             raise DownloadError("Файл после скачивания не найден на диске.")

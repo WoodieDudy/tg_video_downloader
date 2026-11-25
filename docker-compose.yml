@@ -11,6 +11,12 @@ services:
       - tg_bot_api_data:/var/lib/telegram-bot-api
       - downloads_data:/data/downloads
 
+  bgutil-pot-provider:
+    image: brainicism/bgutil-ytdlp-pot-provider:latest
+    container_name: yt-tg-bot-pot
+    restart: unless-stopped
+    init: true
+
   bot:
     build:
       context: .
@@ -19,10 +25,12 @@ services:
     restart: unless-stopped
     depends_on:
       - telegram-bot-api
+      - bgutil-pot-provider
     env_file:
       - .env
     environment:
       LOCAL_BOT_API_URL: http://telegram-bot-api:8081
+      POT_PROVIDER_URL: http://bgutil-pot-provider:4416
       CHROME_PROFILE_DIR: /data/chrome-profile
       COOKIES_FILE: /data/cookies/youtube.txt
       DOWNLOADS_DIR: /data/downloads

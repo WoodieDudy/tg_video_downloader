@@ -8,6 +8,7 @@
 
 ### Сервисы (`docker-compose.yml`)
 - `telegram-bot-api` (`aiogram/telegram-bot-api:latest`, `TELEGRAM_LOCAL=1`): локальный Bot API на `:8081` в Docker-сети; разделяет том `downloads_data:/data/downloads` с `bot`.
+- `bgutil-pot-provider` (`brainicism/bgutil-ytdlp-pot-provider:latest`): HTTP-провайдер PO Token на `:4416` в Docker-сети для анонимного скачивания публичных YouTube-видео через плагин `bgutil-ytdlp-pot-provider`.
 - `bot`: основной процесс (`python -m bot.main`), внутри которого работает долгоживущий headless Chromium (`ChromeSessionManager`) на постоянном томе `chrome_profile:/data/chrome-profile`.
 - `chrome-auth` (профиль `auth`): одноразовый интерактивный контейнер (`docker/auth-entrypoint.sh` с `Xvfb` + `openbox` + `x11vnc` + `noVNC` на `127.0.0.1:6080`) для первичной авторизации в Google без флагов автоматизации.
 
@@ -17,14 +18,14 @@
 - `bot/middlewares/auth.py` — `WhitelistMiddleware`, пропускающий запросы авторизованных пользователей в ЛС и разрешённых групповых чатов (`allowed_chats`, неавторизованные группы игнорируются молча).
 - `bot/services/access.py` — `AccessManager`: роли админов, динамическое добавление/удаление пользователей по `@username` или `user_id`, привязка `@username -> user_id`, список разрешённых групповых чатов (`allowed_chats`), атомарное сохранение в `/data/state/users.json`.
 - `bot/services/chrome_cookies.py` — `ChromeSessionManager`: persistent Playwright Chromium (`channel="chromium"`), очистка зависших `Singleton*` lock-файлов при старте, навигация на `youtube.com`, экспорт cookies через CDP `Network.getAllCookies` в Netscape-формат (`/data/cookies/youtube.txt`), проверка `has_authenticated_cookies`.
-- `bot/services/downloader.py` — `YouTubeDownloader` и общие утилиты (`probe_media`, `compress_video_for_telegram`, `build_telegram_ffmpeg_cmd`): `yt-dlp` метаданные и скачивание, определение вертикальных Shorts (`is_portrait`), обрезка по таймкодам (`--download-sections`, `--force-keyframes-at-cuts`), `ffprobe` метаданные, прогресс-коллбэк и автоповтор (`_with_cookie_retry`) с обновлением cookies при auth/bot ошибках.
+- `bot/services/downloader.py` — `YouTubeDownloader` и общие утилиты (`probe_media`, `compress_video_for_telegram`, `build_telegram_ffmpeg_cmd`): `yt-dlp` метаданные и скачивание, PO Token (`bgutil-pot-provider`) и anonymous-first режим с fallback на cookies (`_with_anonymous_then_cookies`), кэш `--load-info-json`, определение вертикальных Shorts (`is_portrait`), обрезка по таймкодам (`--download-sections`, `--force-keyframes-at-cuts`), `ffprobe` метаданные, прогресс-коллбэк и автоповтор (`_with_cookie_retry`) с обновлением cookies при auth/bot ошибках.
 - `bot/services/instagram.py` — `InstagramDownloader`: скачивание публичных Instagram Reels без аккаунта через `kkinstagram.com` → `eeinstagram.com` (с CDN fallback `*.fbcdn.net` → `scontent.cdninstagram.com`) → `yt-dlp` fallback, обрезка и MP3.
 - `bot/services/tiktok.py` — `TikTokDownloader`: скачивание TikTok без водяного знака через `yt-dlp` (с поддержкой коротких `vm.tiktok.com` / `vt.tiktok.com`).
 - `bot/services/cache.py` — `MediaCache`: персистентный кэш Telegram `file_id` в `/data/state/media_cache.json` (с автоинвалидацией при `TelegramBadRequest`).
 - `bot/services/alerts.py` — `AdminAlertMonitor`: уведомления администраторам при слёте сессии Google или нехватке места на диске с кулдауном.
-- `bot/services/jobs.py` — `PendingJobStore` (TTL-хранилище интерактивных запросов, чтобы `callback_data` оставался < 64 байт) и `asyncio.Semaphore` для ограничения параллельных скачиваний.
+- `bot/services/jobs.py` — `PendingJobStore` (TTL-хранилище интерактивных запросов, чтобы `callback_data` оставался < 64 байт), `RateLimiter` (per-user cooldown и часовой лимит) и `asyncio.Semaphore` для ограничения параллельных скачиваний.
 - `bot/handlers/commands.py` — `/start`, `/help`, `/status`, `/refresh_cookies`, `/clear_cache`, `/add`, `/remove`, `/users`, `/add_chat`, `/remove_chat`, `/chats`, `/cancel` + `my_chat_member` автоактивация группы при добавлении админом или пользователем из белого списка (иначе бот просит обратиться к администратору и выходит из группы).
-- `bot/handlers/youtube.py` — обработка групповых ссылок (`handle_group_shorts`: Shorts/Reels/TikTok без тега + любая поддерживаемая ссылка при `@упоминании` бота, работает и при включённом Privacy Mode), интерактивное меню в ЛС (качество, MP3, обрезка, отправка видео vs файлом `send_document`), кэш `file_id`, FSM `TrimStates.waiting_for_range`.
+- `bot/handlers/youtube.py` — обработка групповых ссылок (`handle_group_shorts`: Shorts/Reels/TikTok без тега + любая поддерживаемая ссылка при `@упоминании` бота, лимит длительности и размера в группах), интерактивное меню в ЛС (качество, MP3, обрезка, отправка видео vs файлом `send_document`), кэш `file_id`, rate limit, FSM `TrimStates.waiting_for_range`.
 - `bot/utils/parsers.py` — нормализация URL YouTube/Shorts, Instagram Reels/Posts и TikTok, парсинг таймкодов и форматирование размеров/длительности.
 
 ## Критичные инварианты и подводные камни

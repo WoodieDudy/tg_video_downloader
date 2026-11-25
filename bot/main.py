@@ -23,7 +23,7 @@ from bot.services.cache import MediaCache
 from bot.services.chrome_cookies import ChromeSessionManager
 from bot.services.downloader import YouTubeDownloader
 from bot.services.instagram import InstagramDownloader
-from bot.services.jobs import PendingJobStore
+from bot.services.jobs import PendingJobStore, RateLimiter
 from bot.services.tiktok import TikTokDownloader
 
 logger = logging.getLogger(__name__)
@@ -144,6 +144,9 @@ async def run() -> None:
         cookie_manager=cookie_manager,
         max_file_size_bytes=settings.max_file_size_bytes,
         js_runtime=settings.ytdlp_js_runtime,
+        pot_provider_url=settings.pot_provider_url,
+        sleep_requests=settings.ytdlp_sleep_requests,
+        concurrent_fragments=settings.ytdlp_concurrent_fragments,
         video_crf=settings.video_crf,
         video_preset=settings.video_preset,
     )
@@ -160,6 +163,10 @@ async def run() -> None:
         video_preset=settings.video_preset,
     )
     job_store = PendingJobStore(max_concurrent_downloads=settings.max_concurrent_downloads)
+    rate_limiter = RateLimiter(
+        cooldown_seconds=settings.user_cooldown_seconds,
+        hourly_limit=settings.user_hourly_limit,
+    )
 
     dp = Dispatcher(storage=MemoryStorage())
 
@@ -178,6 +185,7 @@ async def run() -> None:
     dp["ig_downloader"] = ig_downloader
     dp["tiktok_downloader"] = tiktok_downloader
     dp["job_store"] = job_store
+    dp["rate_limiter"] = rate_limiter
 
     await cookie_manager.start()
     try:
