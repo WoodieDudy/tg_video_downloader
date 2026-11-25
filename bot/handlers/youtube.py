@@ -199,8 +199,16 @@ def _get_message_text(message: Message) -> str:
     return (message.text or message.caption or "").strip()
 
 
-def is_bot_mentioned(message: Message, bot_username: str) -> bool:
-    """Return True if @bot_username is mentioned in the message text or caption."""
+def is_bot_mentioned(message: Message, bot_username: str, bot_id: int | None = None) -> bool:
+    """Return True if @bot_username is mentioned or message replies directly to the bot."""
+    if (
+        bot_id is not None
+        and message.reply_to_message is not None
+        and message.reply_to_message.from_user is not None
+        and message.reply_to_message.from_user.id == bot_id
+    ):
+        return True
+
     uname = bot_username.lstrip("@").lower()
     if not uname:
         return False
@@ -402,7 +410,13 @@ async def handle_group_shorts(
     if not raw_text:
         return
 
-    mentioned = is_bot_mentioned(message, bot_username)
+    mentioned = is_bot_mentioned(message, bot_username, bot_id=bot.id)
+    logger.info(
+        "Group media candidate in chat_id=%s from user_id=%s mentioned=%s",
+        message.chat.id,
+        getattr(message.from_user, "id", None),
+        mentioned,
+    )
     platform = ""
     yt_parsed = parse_user_request(raw_text)
     ig_parsed = None
@@ -410,12 +424,14 @@ async def handle_group_shorts(
 
     if yt_parsed is not None:
         if not yt_parsed.video.is_shorts and not mentioned:
+            logger.info("Skipping non-Shorts YouTube link in group chat_id=%s (not mentioned)", message.chat.id)
             return
         platform = "youtube"
         label = "Shorts" if yt_parsed.video.is_shorts else "видео"
         badge = "📱" if yt_parsed.video.is_shorts else "🎬"
     elif (ig_parsed := parse_instagram_request(raw_text)) is not None:
         if not ig_parsed.media.is_reel and not mentioned:
+            logger.info("Skipping non-Reel Instagram link in group chat_id=%s (not mentioned)", message.chat.id)
             return
         platform = "instagram"
         label = "Reels" if ig_parsed.media.is_reel else "Instagram"

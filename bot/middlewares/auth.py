@@ -33,9 +33,10 @@ class WhitelistMiddleware(BaseMiddleware):
         if chat is not None and chat.type in {ChatType.GROUP, ChatType.SUPERGROUP}:
             if self.access_manager.is_chat_allowed(chat.id) or self.access_manager.is_admin(user.id):
                 return await handler(event, data)
-            logger.debug(
-                "Ignored update in unauthorized group chat_id=%s from user_id=%s",
+            logger.info(
+                "Ignored update in unauthorized group chat_id=%s (%s) from user_id=%s",
                 chat.id,
+                getattr(chat, "title", None),
                 user.id,
             )
             return None
