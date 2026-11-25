@@ -3,12 +3,14 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 from aiogram.enums import ChatType
-from aiogram.types import Chat, ChatMemberUpdated, Message, MessageEntity, User
+from aiogram.types import CallbackQuery, Chat, ChatMemberUpdated, Message, MessageEntity, User
 
 from bot.handlers.commands import cmd_start, on_added_to_group
 from bot.handlers.youtube import (
     _has_supported_media_url,
     _is_group_auto_media,
+    _save_to_cache,
+    cb_download,
     check_group_duration_limit,
     is_bot_mentioned,
 )
@@ -17,8 +19,8 @@ from bot.services.access import AccessManager
 from bot.services.alerts import AdminAlertMonitor
 from bot.services.cache import CachedMedia, MediaCache
 from bot.services.chrome_cookies import SessionStatus
-from bot.services.downloader import AuthRequiredError, YouTubeDownloader
-from bot.services.jobs import RateLimiter
+from bot.services.downloader import AuthRequiredError, DownloadedMedia, VideoInfo, YouTubeDownloader
+from bot.services.jobs import PendingJobStore, RateLimiter
 from bot.services.tiktok import parse_tikwm_payload
 from bot.utils.parsers import TimeRange, extract_tiktok_url, parse_tiktok_request
 
@@ -361,3 +363,120 @@ async def test_anonymous_first_then_cookies_fallback(tmp_path: Path) -> None:
     assert len(calls) == 2
     assert calls[0] is None and calls[1] is not None
     cookie_mgr.get_cookies_snapshot.assert_awaited_once()
+
+
+async def test_send_document_disables_type_detection_and_guards_cache(tmp_path: Path) -> None:
+    cache = MediaCache(tmp_path / "media_cache.json")
+    work_dir = tmp_path / "dl"
+    work_dir.mkdir()
+    video_file = work_dir / "sample.mp4"
+    video_file.write_bytes(b"fake-mp4-data")
+
+    media = DownloadedMedia(
+        job_dir=work_dir,
+        file_path=video_file,
+        title="Short Clip",
+        uploader="Creator",
+        is_audio=False,
+        width=720,
+        height=1280,
+        duration=15,
+        size_bytes=video_file.stat().st_size,
+    )
+
+    # 1. If Telegram converted upload to sent_msg.video, do NOT poison the as_document=True cache slot
+    poisoned_msg = MagicMock(spec=Message)
+    poisoned_msg.document = None
+    poisoned_msg.audio = None
+    poisoned_msg.video = SimpleNamespace(file_id="vid_instead_of_doc")
+    doc_key = MediaCache.make_key(
+        platform="youtube", video_id="vid123", quality="720", as_document=True, time_range=None
+    )
+    _save_to_cache(
+        cache,
+        cache_key=doc_key,
+        sent_msg=poisoned_msg,
+        media=media,
+        title="Short Clip",
+        uploader="Creator",
+        send_as_document=True,
+    )
+    assert cache.get(doc_key) is None
+
+    # 2. Pre-existing poisoned cache entry (media_kind="video" under |1|) must be ignored & evicted,
+    # and bot.send_document must be called with disable_content_type_detection=True.
+    cache.put(
+        doc_key,
+        CachedMedia(
+            file_id="old_video_file_id",
+            media_kind="video",
+            title="Short Clip",
+            uploader="Creator",
+            duration=15,
+            width=720,
+            height=1280,
+            size_bytes=123,
+            created_at=1.0,
+        ),
+    )
+
+    job_store = PendingJobStore()
+    info = VideoInfo(
+        video_id="vid123",
+        title="Short Clip",
+        uploader="Creator",
+        duration=15,
+        webpage_url="https://www.youtube.com/watch?v=vid123",
+        is_shorts=False,
+        is_portrait=True,
+        is_live=False,
+        available_heights=[720],
+        estimated_sizes={720: 1000},
+    )
+    job = job_store.create(user_id=100, chat_id=100, info=info, platform="youtube")
+    job.as_document = True
+
+    status_msg = MagicMock(spec=Message)
+    status_msg.edit_text = AsyncMock()
+    status_msg.delete = AsyncMock()
+
+    callback = MagicMock(spec=CallbackQuery)
+    callback.data = f"dl:{job.job_id}:720"
+    callback.from_user = MagicMock(spec=User, id=100)
+    callback.message = status_msg
+    callback.answer = AsyncMock()
+
+    state = MagicMock()
+    state.clear = AsyncMock()
+
+    sent_doc_msg = MagicMock(spec=Message)
+    sent_doc_msg.document = SimpleNamespace(file_id="real_doc_file_id")
+    sent_doc_msg.video = None
+    sent_doc_msg.audio = None
+
+    bot = MagicMock()
+    bot.send_chat_action = AsyncMock()
+    bot.send_document = AsyncMock(return_value=sent_doc_msg)
+    bot.send_video = AsyncMock()
+
+    downloader = MagicMock()
+    downloader.download = AsyncMock(return_value=media)
+
+    await cb_download(
+        callback=callback,
+        state=state,
+        bot=bot,
+        downloader=downloader,
+        ig_downloader=MagicMock(),
+        tiktok_downloader=MagicMock(),
+        media_cache=cache,
+        job_store=job_store,
+    )
+
+    bot.send_video.assert_not_awaited()
+    bot.send_document.assert_awaited_once()
+    assert bot.send_document.call_args.kwargs["disable_content_type_detection"] is True
+    repaired = cache.get(doc_key)
+    assert repaired is not None
+    assert repaired.media_kind == "document"
+    assert repaired.file_id == "real_doc_file_id"

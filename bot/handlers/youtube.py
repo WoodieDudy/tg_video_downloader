@@ -328,7 +328,9 @@ def _save_to_cache(
 ) -> None:
     file_id: str | None = None
     media_kind = "video"
-    if send_as_document and sent_msg.document:
+    if send_as_document:
+        if not sent_msg.document:
+            return
         file_id = sent_msg.document.file_id
         media_kind = "document"
     elif media.is_audio and sent_msg.audio:
@@ -1138,7 +1140,11 @@ async def cb_download(
 
     cached = media_cache.get(cache_key)
     if cached is not None:
-        if await _send_from_cache(
+        if (send_as_document and cached.media_kind != "document") or (
+            not send_as_document and cached.media_kind == "document"
+        ):
+            media_cache.delete(cache_key)
+        elif await _send_from_cache(
             bot=bot,
             chat_id=job.chat_id,
             cached=cached,
@@ -1149,7 +1155,8 @@ async def cb_download(
             except TelegramBadRequest:
                 pass
             return
-        media_cache.delete(cache_key)
+        else:
+            media_cache.delete(cache_key)
 
     if rate_limiter is not None:
         is_admin = bool(access_manager and access_manager.is_admin(callback.from_user.id))
@@ -1207,6 +1214,7 @@ async def cb_download(
                 document=input_file,
                 caption=caption,
                 parse_mode="HTML",
+                disable_content_type_detection=True,
             )
         elif media.is_audio:
             await bot.send_chat_action(chat_id=job.chat_id, action=ChatAction.UPLOAD_DOCUMENT)
