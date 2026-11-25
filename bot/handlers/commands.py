@@ -109,44 +109,44 @@ async def on_added_to_group(
             except Exception:
                 pass
 
-    mention = f"@{bot_username}" if bot_username else "бота"
     dl_cmd = f"/dl@{bot_username}" if bot_username else "/dl"
     await event.bot.send_message(
         event.chat.id,
-        "👋 Чат активирован!\n\n"
-        "<b>Как пользоваться в чате:</b>\n"
-        f"• <b>Без доступа ко всем сообщениям (Privacy Mode):</b> отправь <code>{dl_cmd} &lt;ссылка&gt;</code>, ответь командой <code>{dl_cmd}</code> на сообщение со ссылкой или ответь ссылкой на сообщение {mention}.\n"
-        "• <b>Автоматически без команды (Shorts, Reels, TikTok):</b> выдай боту права администратора или отключи Privacy Mode в @BotFather (/setprivacy → Disable, после чего удали бота и добавь снова).",
+        "👋 Привет! Я помогаю скачивать видео с YouTube, YouTube Shorts, Instagram Reels и TikTok.\n\n"
+        f"• Отправь <code>{dl_cmd} &lt;ссылка&gt;</code>\n"
+        f"• Или ответь (reply) командой <code>{dl_cmd}</code> на сообщение со ссылкой\n\n"
+        "Подробная справка: /help",
         parse_mode="HTML",
     )
 
 
-@router.message(Command("start", "help"))
-async def cmd_start(
-    message: Message,
-    state: FSMContext,
-    access_manager: AccessManager,
-    bot_username: str = "",
-) -> None:
-    await state.clear()
-    is_admin = bool(message.from_user and access_manager.is_admin(message.from_user.id))
+def _build_group_help(bot_username: str) -> str:
     dl_cmd = f"/dl@{bot_username}" if bot_username else "/dl"
+    return (
+        "🎬 <b>Справка для группового чата</b>\n\n"
+        "<b>Как скачать видео (YouTube, Shorts, Instagram Reels, TikTok):</b>\n"
+        f"• Отправь команду с ссылкой:\n  <code>{dl_cmd} https://...</code>\n"
+        f"• Или ответь (reply) командой <code>{dl_cmd}</code> на сообщение, где уже есть ссылка\n"
+        "• Можно добавить таймкод обрезки после ссылки:\n"
+        f"  <code>{dl_cmd} https://youtu.be/... 00:30-01:15</code>\n\n"
+        "Если у бота есть доступ ко всем сообщениям в чате, ссылки на <b>Shorts</b>, <b>Reels</b> и <b>TikTok</b> он скачивает автоматически."
+    )
+
+
+def _build_private_help(*, is_admin: bool) -> str:
     text = (
         "👋 <b>Привет! Я скачиваю видео с YouTube, YouTube Shorts, Instagram Reels и TikTok (до 2 ГБ).</b>\n\n"
-        "<b>В личных сообщениях:</b>\n"
-        "• Отправь ссылку:\n"
+        "<b>Как пользоваться в личных сообщениях:</b>\n"
+        "• Просто отправь ссылку:\n"
         "  <code>https://www.youtube.com/watch?v=...</code>\n"
         "  <code>https://youtube.com/shorts/...</code>\n"
         "  <code>https://www.instagram.com/reel/...</code>\n"
         "  <code>https://www.tiktok.com/@.../video/...</code>\n"
+        "• Выбери нужное качество, формат отправки (<b>как видео</b> или <b>как файл</b> без сжатия) или <b>MP3</b>.\n"
         "• Чтобы сразу обрезать по таймкодам, добавь диапазон после ссылки:\n"
         "  <code>https://youtu.be/... 01:15-02:30</code>\n"
-        "  или нажми кнопку <b>✂️ Обрезать</b>. Доступна отправка как видео или как файл.\n\n"
-        "<b>В групповом чате:</b>\n"
-        f"• При включённом Privacy Mode («не имеет доступа к сообщениям»): используй <code>{dl_cmd} &lt;ссылка&gt;</code> или ответь (reply) командой <code>{dl_cmd}</code> на сообщение со ссылкой.\n"
-        "• Если у бота есть доступ ко всем сообщениям (админ или Privacy Mode выключен), он автоматически скачивает <b>Shorts</b>, <b>Reels</b> и <b>TikTok</b> без команд.\n\n"
+        "  или нажми кнопку <b>✂️ Обрезать</b>.\n\n"
         "<b>Команды:</b>\n"
-        "/dl &lt;ссылка&gt; — скачать видео в чате\n"
         "/status — статус headless Chrome, сессии Google, кэша и диска\n"
         "/cancel — отменить ввод таймкода"
     )
@@ -158,11 +158,35 @@ async def cmd_start(
             "/add @username — разрешить доступ пользователю по @username или ID\n"
             "/remove @username — забрать доступ у пользователя\n"
             "/users — список пользователей с доступом\n"
-            "/add_chat [chat_id] — разрешить автоскачивание в чате\n"
+            "/add_chat [chat_id] — разрешить чат\n"
             "/remove_chat [chat_id] — отключить чат\n"
             "/chats — список разрешённых чатов"
         )
-    await message.answer(text, parse_mode="HTML", disable_web_page_preview=True)
+    return text
+
+
+@router.message(Command("start", "help"))
+async def cmd_start(
+    message: Message,
+    state: FSMContext,
+    access_manager: AccessManager,
+    bot_username: str = "",
+) -> None:
+    await state.clear()
+    if message.chat.type in {ChatType.GROUP, ChatType.SUPERGROUP}:
+        await message.answer(
+            _build_group_help(bot_username),
+            parse_mode="HTML",
+            disable_web_page_preview=True,
+        )
+        return
+
+    is_admin = bool(message.from_user and access_manager.is_admin(message.from_user.id))
+    await message.answer(
+        _build_private_help(is_admin=is_admin),
+        parse_mode="HTML",
+        disable_web_page_preview=True,
+    )
 
 
 @router.message(Command("cancel"))

@@ -2,9 +2,10 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
+from aiogram.enums import ChatType
 from aiogram.types import Chat, ChatMemberUpdated, Message, MessageEntity, User
 
-from bot.handlers.commands import on_added_to_group
+from bot.handlers.commands import cmd_start, on_added_to_group
 from bot.handlers.youtube import _has_supported_media_url, _is_group_auto_media, is_bot_mentioned
 from bot.main import cleanup_stale_downloads
 from bot.services.access import AccessManager
@@ -246,3 +247,36 @@ async def test_group_activation_only_by_whitelisted_user(tmp_path: Path) -> None
     assert 777 in access.allowed_ids
     bot.leave_chat.assert_not_awaited()
     assert bot.send_message.await_count == 2  # admin notification + group welcome
+
+    welcome_text = bot.send_message.call_args_list[-1].args[1].lower()
+    assert "privacy" not in welcome_text
+    assert "botfather" not in welcome_text
+    assert "администратор" not in welcome_text
+    assert "/dl@example_bot" in welcome_text
+
+
+async def test_separate_help_for_private_and_group(tmp_path: Path) -> None:
+    access = AccessManager(tmp_path / "users.json", admin_ids={100})
+    state = MagicMock()
+    state.clear = AsyncMock()
+
+    group_msg = MagicMock(spec=Message)
+    group_msg.chat = MagicMock(spec=Chat, id=-100222, type=ChatType.SUPERGROUP)
+    group_msg.from_user = MagicMock(spec=User, id=100)
+    group_msg.answer = AsyncMock()
+
+    await cmd_start(group_msg, state, access, bot_username="example_bot")
+    group_help = group_msg.answer.call_args.args[0]
+    assert "Справка для группового чата" in group_help
+    assert "/dl@example_bot" in group_help
+    assert "Админ-команды" not in group_help
+
+    pm_msg = MagicMock(spec=Message)
+    pm_msg.chat = MagicMock(spec=Chat, id=100, type=ChatType.PRIVATE)
+    pm_msg.from_user = MagicMock(spec=User, id=100)
+    pm_msg.answer = AsyncMock()
+
+    await cmd_start(pm_msg, state, access, bot_username="example_bot")
+    pm_help = pm_msg.answer.call_args.args[0]
+    assert "личных сообщениях" in pm_help
+    assert "Админ-команды" in pm_help
