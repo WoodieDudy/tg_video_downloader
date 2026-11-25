@@ -2,8 +2,9 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
-from aiogram.types import Message, MessageEntity
+from aiogram.types import Chat, ChatMemberUpdated, Message, MessageEntity, User
 
+from bot.handlers.commands import on_added_to_group
 from bot.handlers.youtube import _has_supported_media_url, _is_group_auto_media, is_bot_mentioned
 from bot.main import cleanup_stale_downloads
 from bot.services.access import AccessManager
@@ -200,3 +201,37 @@ def test_is_bot_mentioned_and_supported_urls(tmp_path: Path) -> None:
     assert access.is_admin(5550001) is True
     reloaded = AccessManager(users_file, admin_ids=set())
     assert reloaded.is_admin(5550001) is True
+
+
+async def test_group_activation_only_by_whitelisted_user(tmp_path: Path) -> None:
+    users_file = tmp_path / "users.json"
+    access = AccessManager(users_file, admin_ids={100})
+    access.add_target("@trusted_friend")
+
+    bot = MagicMock()
+    bot.send_message = AsyncMock()
+    bot.leave_chat = AsyncMock()
+
+    # 1. Stranger adds bot -> bot leaves and does NOT activate chat
+    stranger_event = MagicMock(spec=ChatMemberUpdated)
+    stranger_event.bot = bot
+    stranger_event.chat = MagicMock(spec=Chat, id=-100111, title="Random Chat")
+    stranger_event.from_user = MagicMock(spec=User, id=999, username="stranger")
+
+    await on_added_to_group(stranger_event, access, bot_username="example_bot")
+    assert access.is_chat_allowed(-100111) is False
+    bot.leave_chat.assert_awaited_once_with(-100111)
+    bot.send_message.assert_not_awaited()
+
+    # 2. Whitelisted user (matched by @username) adds bot -> chat activated + admin notified
+    bot.leave_chat.reset_mock()
+    friend_event = MagicMock(spec=ChatMemberUpdated)
+    friend_event.bot = bot
+    friend_event.chat = MagicMock(spec=Chat, id=-100222, title="Friends Chat")
+    friend_event.from_user = MagicMock(spec=User, id=777, username="Trusted_Friend")
+
+    await on_added_to_group(friend_event, access, bot_username="example_bot")
+    assert access.is_chat_allowed(-100222) is True
+    assert 777 in access.allowed_ids
+    bot.leave_chat.assert_not_awaited()
+    assert bot.send_message.await_count == 2  # admin notification + group welcome

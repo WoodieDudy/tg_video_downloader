@@ -23,7 +23,7 @@
 - `bot/services/cache.py` — `MediaCache`: персистентный кэш Telegram `file_id` в `/data/state/media_cache.json` (с автоинвалидацией при `TelegramBadRequest`).
 - `bot/services/alerts.py` — `AdminAlertMonitor`: уведомления администраторам при слёте сессии Google или нехватке места на диске с кулдауном.
 - `bot/services/jobs.py` — `PendingJobStore` (TTL-хранилище интерактивных запросов, чтобы `callback_data` оставался < 64 байт) и `asyncio.Semaphore` для ограничения параллельных скачиваний.
-- `bot/handlers/commands.py` — `/start`, `/help`, `/status`, `/refresh_cookies`, `/clear_cache`, `/add`, `/remove`, `/users`, `/add_chat`, `/remove_chat`, `/chats`, `/cancel` + `my_chat_member` автоактивация группы при добавлении админом.
+- `bot/handlers/commands.py` — `/start`, `/help`, `/status`, `/refresh_cookies`, `/clear_cache`, `/add`, `/remove`, `/users`, `/add_chat`, `/remove_chat`, `/chats`, `/cancel` + `my_chat_member` автоактивация группы при добавлении админом или пользователем из белого списка (иначе бот выходит из группы).
 - `bot/handlers/youtube.py` — обработка групповых ссылок (`handle_group_shorts`: Shorts/Reels/TikTok без тега + любая поддерживаемая ссылка при `@упоминании` бота, работает и при включённом Privacy Mode), интерактивное меню в ЛС (качество, MP3, обрезка, отправка видео vs файлом `send_document`), кэш `file_id`, FSM `TrimStates.waiting_for_range`.
 - `bot/utils/parsers.py` — нормализация URL YouTube/Shorts, Instagram Reels/Posts и TikTok, парсинг таймкодов и форматирование размеров/длительности.
 

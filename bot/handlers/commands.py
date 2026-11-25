@@ -65,11 +65,12 @@ async def on_added_to_group(
     access_manager: AccessManager,
     bot_username: str = "",
 ) -> None:
-    if not event.from_user or not access_manager.is_admin(event.from_user.id):
+    user = event.from_user
+    if not user or not access_manager.check_and_bind(user.id, getattr(user, "username", None)):
         logger.warning(
-            "Bot added to group chat_id=%s by non-admin user_id=%s; leaving chat.",
+            "Bot added to group chat_id=%s by unauthorized user_id=%s; leaving chat.",
             event.chat.id,
-            getattr(event.from_user, "id", None),
+            getattr(user, "id", None),
         )
         try:
             await event.bot.leave_chat(event.chat.id)
@@ -77,8 +78,28 @@ async def on_added_to_group(
             pass
         return
 
-    access_manager.add_chat(event.chat.id, event.chat.title)
-    logger.info("Admin %s added bot to group chat_id=%s (%s)", event.from_user.id, event.chat.id, event.chat.title)
+    newly_added = access_manager.add_chat(event.chat.id, event.chat.title)
+    logger.info(
+        "Whitelisted user %s (@%s) added bot to group chat_id=%s (%s)",
+        user.id,
+        getattr(user, "username", None),
+        event.chat.id,
+        event.chat.title,
+    )
+    if newly_added and not access_manager.is_admin(user.id):
+        who = f"@{html.escape(user.username)}" if user.username else f"<code>{user.id}</code>"
+        chat_title = html.escape(event.chat.title or str(event.chat.id))
+        for admin_id in sorted(access_manager.admin_ids):
+            try:
+                await event.bot.send_message(
+                    admin_id,
+                    f"ℹ️ Пользователь {who} (<code>{user.id}</code>) добавил бота в чат "
+                    f"<b>{chat_title}</b> (<code>{event.chat.id}</code>).",
+                    parse_mode="HTML",
+                )
+            except Exception:
+                pass
+
     mention = f"@{bot_username}" if bot_username else "бота"
     await event.bot.send_message(
         event.chat.id,
