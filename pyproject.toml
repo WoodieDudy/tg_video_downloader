@@ -1,0 +1,22 @@
+[project]
+name = "yt-tg-bot"
+version = "0.1.0"
+description = "Telegram bot for downloading YouTube videos via Local Bot API and persistent headless Chrome session cookies"
+requires-python = ">=3.12"
+dependencies = [
+    "aiogram>=3.13,<4.0",
+    "pydantic-settings>=2.5,<3.0",
+    "playwright>=1.49,<2.0",
+    "yt-dlp[default]",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.3,<9.0",
+    "pytest-asyncio>=0.24,<1.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"

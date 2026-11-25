@@ -1,0 +1,66 @@
+services:
+  telegram-bot-api:
+    image: aiogram/telegram-bot-api:latest
+    container_name: yt-tg-bot-api
+    restart: unless-stopped
+    environment:
+      TELEGRAM_API_ID: ${TELEGRAM_API_ID:?Set TELEGRAM_API_ID in .env}
+      TELEGRAM_API_HASH: ${TELEGRAM_API_HASH:?Set TELEGRAM_API_HASH in .env}
+      TELEGRAM_LOCAL: "1"
+    volumes:
+      - tg_bot_api_data:/var/lib/telegram-bot-api
+      - downloads_data:/data/downloads
+
+  bot:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: yt-tg-bot
+    restart: unless-stopped
+    depends_on:
+      - telegram-bot-api
+    env_file:
+      - .env
+    environment:
+      LOCAL_BOT_API_URL: http://telegram-bot-api:8081
+      CHROME_PROFILE_DIR: /data/chrome-profile
+      COOKIES_FILE: /data/cookies/youtube.txt
+      DOWNLOADS_DIR: /data/downloads
+      USERS_FILE: /data/state/users.json
+      CACHE_FILE: /data/state/media_cache.json
+    shm_size: "1gb"
+    volumes:
+      - chrome_profile:/data/chrome-profile
+      - cookies_data:/data/cookies
+      - downloads_data:/data/downloads
+      - state_data:/data/state
+
+  # One-time interactive login service (launch only when authenticating Google account):
+  #   docker compose stop bot
+  #   docker compose --profile auth up -d chrome-auth
+  # After signing in via noVNC (http://localhost:6080/vnc.html):
+  #   docker compose --profile auth stop chrome-auth
+  #   docker compose start bot
+  chrome-auth:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: yt-tg-bot-chrome-auth
+    profiles: ["auth"]
+    entrypoint: ["/app/docker/auth-entrypoint.sh"]
+    env_file:
+      - .env
+    environment:
+      CHROME_PROFILE_DIR: /data/chrome-profile
+    shm_size: "1gb"
+    ports:
+      - "127.0.0.1:6080:6080"
+    volumes:
+      - chrome_profile:/data/chrome-profile
+
+volumes:
+  tg_bot_api_data:
+  chrome_profile:
+  cookies_data:
+  downloads_data:
+  state_data:
