@@ -12,6 +12,7 @@ from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.client.telegram import TelegramAPIServer
 from aiogram.enums import ParseMode
 from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.types import BotCommand, BotCommandScopeAllGroupChats, BotCommandScopeDefault
 
 from bot.config import Settings, load_settings
 from bot.handlers import commands, youtube
@@ -84,6 +85,28 @@ def cleanup_stale_downloads(downloads_dir: Path) -> None:
                 item.unlink(missing_ok=True)
         except OSError as exc:
             logger.warning("Could not clean stale download %s: %s", item, exc)
+
+
+async def register_commands(bot: Bot) -> None:
+    """Register bot commands so /dl appears in Telegram group & PM autocomplete."""
+    try:
+        await bot.set_my_commands(
+            [
+                BotCommand(command="dl", description="Скачать видео / Shorts / Reels / TikTok"),
+                BotCommand(command="status", description="Статус бота и Chrome-сессии"),
+                BotCommand(command="help", description="Справка"),
+            ],
+            scope=BotCommandScopeDefault(),
+        )
+        await bot.set_my_commands(
+            [
+                BotCommand(command="dl", description="Скачать видео по ссылке или reply"),
+                BotCommand(command="help", description="Справка"),
+            ],
+            scope=BotCommandScopeAllGroupChats(),
+        )
+    except Exception as exc:
+        logger.warning("Failed to set bot commands: %s", exc)
 
 
 async def run() -> None:
@@ -162,6 +185,7 @@ async def run() -> None:
         dp["bot_username"] = (
             settings.bot_username.strip().lstrip("@").lower() or detected_username
         )
+        await register_commands(bot)
         await alert_monitor.evaluate(cookie_manager.status)
         await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
     finally:

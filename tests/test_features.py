@@ -191,8 +191,17 @@ def test_is_bot_mentioned_and_supported_urls(tmp_path: Path) -> None:
     caption_msg.caption = "Глянь @EXAMPLE_DOWNLOAD_BOT https://www.instagram.com/p/aye83DjauH/"
     caption_msg.entities = None
     caption_msg.caption_entities = None
+    caption_msg.reply_to_message = None
     assert is_bot_mentioned(caption_msg, "example_download_bot") is True
     assert _has_supported_media_url(caption_msg.caption) is True
+
+    cmd_msg = MagicMock(spec=Message)
+    cmd_msg.text = "/dl@example_download_bot https://www.youtube.com/watch?v=dQw4w9WgXcQ"
+    cmd_msg.caption = None
+    cmd_msg.entities = None
+    cmd_msg.caption_entities = None
+    cmd_msg.reply_to_message = None
+    assert is_bot_mentioned(cmd_msg, "example_download_bot") is True
 
     # Verify ADMIN_USERNAMES auto-binds to admin_ids
     users_file = tmp_path / "users.json"

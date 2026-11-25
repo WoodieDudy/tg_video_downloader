@@ -10,6 +10,7 @@ from typing import Any
 from aiogram import Bot, F, Router
 from aiogram.enums import ChatAction, ChatType
 from aiogram.exceptions import TelegramBadRequest
+from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import (
@@ -195,12 +196,27 @@ def _has_supported_media_url(txt: str | None) -> bool:
     )
 
 
+_DL_COMMANDS = {"/dl", "/v", "/get", "/download"}
+
+
 def _get_message_text(message: Message) -> str:
     return (message.text or message.caption or "").strip()
 
 
+def _has_dl_command(message: Message) -> bool:
+    text = _get_message_text(message)
+    if not text.startswith("/"):
+        return False
+    first_token = text.split(maxsplit=1)[0].lower()
+    cmd_name = first_token.split("@", 1)[0]
+    return cmd_name in _DL_COMMANDS
+
+
 def is_bot_mentioned(message: Message, bot_username: str, bot_id: int | None = None) -> bool:
-    """Return True if @bot_username is mentioned or message replies directly to the bot."""
+    """Return True if message uses /dl command, mentions @bot_username, or replies to the bot."""
+    if _has_dl_command(message):
+        return True
+
     if (
         bot_id is not None
         and message.reply_to_message is not None
@@ -391,9 +407,15 @@ async def _try_group_cache_hit(
     return False
 
 
+def _is_group_trigger(message: Message) -> bool:
+    if _has_supported_media_url(_get_message_text(message)):
+        return True
+    return _has_dl_command(message)
+
+
 @router.message(
     F.chat.type.in_({ChatType.GROUP, ChatType.SUPERGROUP}),
-    F.func(lambda msg: _has_supported_media_url(_get_message_text(msg))),
+    F.func(_is_group_trigger),
 )
 async def handle_group_shorts(
     message: Message,
@@ -405,12 +427,31 @@ async def handle_group_shorts(
     job_store: PendingJobStore,
     bot_username: str = "",
 ) -> None:
-    """Download media in authorized group chats (auto for Shorts/Reels/TikTok, any link when @tagged)."""
-    raw_text = _get_message_text(message)
-    if not raw_text:
+    """Download media in authorized group chats (/dl, reply-to-bot, @mention, or auto Shorts/Reels/TikTok)."""
+    own_text = _get_message_text(message)
+    reply_text = (
+        _get_message_text(message.reply_to_message)
+        if message.reply_to_message is not None
+        else ""
+    )
+    if _has_supported_media_url(own_text):
+        raw_text = own_text
+        mentioned = is_bot_mentioned(message, bot_username, bot_id=bot.id)
+    elif _has_dl_command(message) and _has_supported_media_url(reply_text):
+        raw_text = reply_text
+        mentioned = True
+    elif _has_dl_command(message):
+        mention = f"@{bot_username}" if bot_username else ""
+        cmd_hint = f"/dl{mention}" if mention else "/dl"
+        await message.reply(
+            f"Укажи ссылку после команды, например <code>{cmd_hint} https://youtu.be/...</code>, "
+            f"или ответь командой <code>{cmd_hint}</code> на сообщение со ссылкой.",
+            parse_mode="HTML",
+        )
+        return
+    else:
         return
 
-    mentioned = is_bot_mentioned(message, bot_username, bot_id=bot.id)
     logger.info(
         "Group media candidate in chat_id=%s from user_id=%s mentioned=%s",
         message.chat.id,

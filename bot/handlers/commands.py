@@ -110,12 +110,13 @@ async def on_added_to_group(
                 pass
 
     mention = f"@{bot_username}" if bot_username else "бота"
+    dl_cmd = f"/dl@{bot_username}" if bot_username else "/dl"
     await event.bot.send_message(
         event.chat.id,
         "👋 Чат активирован!\n\n"
         "<b>Как пользоваться в чате:</b>\n"
-        f"• <b>По тегу (доступ ко всем сообщениям не нужен):</b> отправь {mention} и ссылку в одном сообщении — скачаю Shorts, Reels, TikTok или YouTube-видео.\n"
-        "• <b>Автоматически без тега (Shorts, Reels, TikTok):</b> выдай боту права администратора или отключи Privacy Mode в @BotFather (/setprivacy → Disable, после чего удали бота и добавь снова).",
+        f"• <b>Без доступа ко всем сообщениям (Privacy Mode):</b> отправь <code>{dl_cmd} &lt;ссылка&gt;</code>, ответь командой <code>{dl_cmd}</code> на сообщение со ссылкой или ответь ссылкой на сообщение {mention}.\n"
+        "• <b>Автоматически без команды (Shorts, Reels, TikTok):</b> выдай боту права администратора или отключи Privacy Mode в @BotFather (/setprivacy → Disable, после чего удали бота и добавь снова).",
         parse_mode="HTML",
     )
 
@@ -129,7 +130,7 @@ async def cmd_start(
 ) -> None:
     await state.clear()
     is_admin = bool(message.from_user and access_manager.is_admin(message.from_user.id))
-    mention = f"@{bot_username}" if bot_username else "@bot"
+    dl_cmd = f"/dl@{bot_username}" if bot_username else "/dl"
     text = (
         "👋 <b>Привет! Я скачиваю видео с YouTube, YouTube Shorts, Instagram Reels и TikTok (до 2 ГБ).</b>\n\n"
         "<b>В личных сообщениях:</b>\n"
@@ -142,9 +143,10 @@ async def cmd_start(
         "  <code>https://youtu.be/... 01:15-02:30</code>\n"
         "  или нажми кнопку <b>✂️ Обрезать</b>. Доступна отправка как видео или как файл.\n\n"
         "<b>В групповом чате:</b>\n"
-        f"• Тегни <code>{mention}</code> и приложи любую ссылку в одном сообщении — работает даже без доступа ко всем сообщениям.\n"
-        "• Если у бота есть доступ ко всем сообщениям, он также автоматически скачивает <b>Shorts</b>, <b>Reels</b> и <b>TikTok</b> без тега.\n\n"
+        f"• При включённом Privacy Mode («не имеет доступа к сообщениям»): используй <code>{dl_cmd} &lt;ссылка&gt;</code> или ответь (reply) командой <code>{dl_cmd}</code> на сообщение со ссылкой.\n"
+        "• Если у бота есть доступ ко всем сообщениям (админ или Privacy Mode выключен), он автоматически скачивает <b>Shorts</b>, <b>Reels</b> и <b>TikTok</b> без команд.\n\n"
         "<b>Команды:</b>\n"
+        "/dl &lt;ссылка&gt; — скачать видео в чате\n"
         "/status — статус headless Chrome, сессии Google, кэша и диска\n"
         "/cancel — отменить ввод таймкода"
     )
