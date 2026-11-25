@@ -212,7 +212,7 @@ async def test_group_activation_only_by_whitelisted_user(tmp_path: Path) -> None
     bot.send_message = AsyncMock()
     bot.leave_chat = AsyncMock()
 
-    # 1. Stranger adds bot -> bot leaves and does NOT activate chat
+    # 1. Stranger adds bot -> bot explains access is needed, then leaves without activating chat
     stranger_event = MagicMock(spec=ChatMemberUpdated)
     stranger_event.bot = bot
     stranger_event.chat = MagicMock(spec=Chat, id=-100111, title="Random Chat")
@@ -220,11 +220,13 @@ async def test_group_activation_only_by_whitelisted_user(tmp_path: Path) -> None
 
     await on_added_to_group(stranger_event, access, bot_username="example_bot")
     assert access.is_chat_allowed(-100111) is False
+    bot.send_message.assert_awaited_once()
+    assert "администратору" in bot.send_message.call_args.args[1].lower()
     bot.leave_chat.assert_awaited_once_with(-100111)
-    bot.send_message.assert_not_awaited()
 
     # 2. Whitelisted user (matched by @username) adds bot -> chat activated + admin notified
     bot.leave_chat.reset_mock()
+    bot.send_message.reset_mock()
     friend_event = MagicMock(spec=ChatMemberUpdated)
     friend_event.bot = bot
     friend_event.chat = MagicMock(spec=Chat, id=-100222, title="Friends Chat")

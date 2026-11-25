@@ -72,6 +72,16 @@ async def on_added_to_group(
             event.chat.id,
             getattr(user, "id", None),
         )
+        id_line = f"\nВаш Telegram ID: <code>{user.id}</code>" if user else ""
+        try:
+            await event.bot.send_message(
+                event.chat.id,
+                "⛔ У вас нет доступа к боту — чат не активирован.\n"
+                f"Напишите администратору, чтобы он выдал вам доступ к боту.{id_line}",
+                parse_mode="HTML",
+            )
+        except Exception:
+            pass
         try:
             await event.bot.leave_chat(event.chat.id)
         except Exception:
