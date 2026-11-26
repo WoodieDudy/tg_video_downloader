@@ -65,7 +65,13 @@ class Settings(BaseSettings):
     cookie_refresh_interval_minutes: int = 240
     low_disk_warn_gb: float = 3.0
     alert_cooldown_minutes: int = 360
-    max_concurrent_downloads: int = 2
+    max_concurrent_downloads: int = 1
+    queue_wait_timeout_seconds: int = 120
+    queue_max_size: int = 15
+    queue_task_gap_seconds: float = 2.0
+    fetch_info_timeout_seconds: int = 45
+    download_timeout_seconds: int = 300
+    ytdlp_socket_timeout_seconds: int = 20
     max_file_size_mb: int = 2000
     group_max_duration_seconds: int = 120
     group_max_file_size_mb: int = 150

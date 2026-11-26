@@ -154,6 +154,34 @@ def is_telegram_compatible_probe(probe: dict[str, Any], file_path: Path) -> bool
     )
 
 
+async def terminate_process(proc: asyncio.subprocess.Process) -> None:
+    """Ensure a child process is stopped without leaving zombies on timeout or cancel."""
+    if proc.returncode is not None:
+        return
+    try:
+        proc.kill()
+    except ProcessLookupError:
+        return
+    try:
+        await proc.wait()
+    except Exception:
+        pass
+
+
+async def communicate_with_timeout(
+    proc: asyncio.subprocess.Process,
+    timeout: float | None,
+) -> tuple[bytes, bytes]:
+    """Wait for subprocess output with timeout, killing the process on timeout or cancel."""
+    try:
+        if timeout is not None and timeout > 0:
+            return await asyncio.wait_for(proc.communicate(), timeout=timeout)
+        return await proc.communicate()
+    except BaseException:
+        await terminate_process(proc)
+        raise
+
+
 async def probe_media(file_path: Path) -> dict[str, Any]:
     """Run ffprobe on a local media file and return normalized stream/format metadata."""
     cmd = [
@@ -171,7 +199,7 @@ async def probe_media(file_path: Path) -> dict[str, Any]:
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.DEVNULL,
     )
-    stdout_b, _ = await proc.communicate()
+    stdout_b, _ = await communicate_with_timeout(proc, 20.0)
     if proc.returncode != 0:
         return {}
 
@@ -242,7 +270,15 @@ async def compress_video_for_telegram(
         stdout=asyncio.subprocess.DEVNULL,
         stderr=asyncio.subprocess.PIPE,
     )
-    _, stderr_b = await proc.communicate()
+    try:
+        _, stderr_b = await communicate_with_timeout(proc, 180.0)
+    except TimeoutError:
+        logger.warning("ffmpeg compression timed out (keeping original)")
+        compressed_path.unlink(missing_ok=True)
+        return input_path
+    except asyncio.CancelledError:
+        compressed_path.unlink(missing_ok=True)
+        raise
     if proc.returncode != 0 or not compressed_path.exists():
         err_txt = stderr_b.decode("utf-8", errors="replace").strip()
         logger.warning("ffmpeg compression failed (keeping original): %s", err_txt)
@@ -403,6 +439,9 @@ class YouTubeDownloader:
         pot_provider_url: str | None = None,
         sleep_requests: float = 1.0,
         concurrent_fragments: int = 2,
+        socket_timeout_seconds: int = 20,
+        fetch_timeout_seconds: int = 45,
+        download_timeout_seconds: int = 300,
         video_crf: int = 24,
         video_preset: str = "medium",
     ) -> None:
@@ -413,6 +452,9 @@ class YouTubeDownloader:
         self.pot_provider_url = pot_provider_url.rstrip("/") if pot_provider_url else None
         self.sleep_requests = sleep_requests
         self.concurrent_fragments = concurrent_fragments
+        self.socket_timeout_seconds = socket_timeout_seconds
+        self.fetch_timeout_seconds = fetch_timeout_seconds
+        self.download_timeout_seconds = download_timeout_seconds
         self.video_crf = video_crf
         self.video_preset = video_preset
         self._info_cache: dict[str, _InfoCacheEntry] = {}
@@ -558,6 +600,8 @@ class YouTubeDownloader:
             args.extend(["--sleep-requests", str(self.sleep_requests)])
         if self.concurrent_fragments > 0:
             args.extend(["--concurrent-fragments", str(self.concurrent_fragments)])
+        if self.socket_timeout_seconds > 0:
+            args.extend(["--socket-timeout", str(self.socket_timeout_seconds)])
         if cookies_path is not None and cookies_path.exists():
             args.extend(["--cookies", str(cookies_path)])
         return args
@@ -579,7 +623,14 @@ class YouTubeDownloader:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
-        stdout_b, stderr_b = await proc.communicate()
+        try:
+            stdout_b, stderr_b = await communicate_with_timeout(
+                proc, self.fetch_timeout_seconds
+            )
+        except TimeoutError as exc:
+            raise DownloadError(
+                f"Превышено время ожидания ответа YouTube ({self.fetch_timeout_seconds} сек.)."
+            ) from exc
         stderr_text = stderr_b.decode("utf-8", errors="replace").strip()
 
         if proc.returncode != 0:
@@ -729,8 +780,26 @@ class YouTubeDownloader:
                     if line:
                         stderr_lines.append(line)
 
-            await asyncio.gather(_read_stdout(), _read_stderr())
-            returncode = await proc.wait()
+            async def _wait_download() -> int:
+                await asyncio.gather(_read_stdout(), _read_stderr())
+                return await proc.wait()
+
+            try:
+                if self.download_timeout_seconds > 0:
+                    returncode = await asyncio.wait_for(
+                        _wait_download(), timeout=self.download_timeout_seconds
+                    )
+                else:
+                    returncode = await _wait_download()
+            except TimeoutError as exc:
+                await terminate_process(proc)
+                raise DownloadError(
+                    f"Превышено время скачивания ({self.download_timeout_seconds} сек.)."
+                ) from exc
+            except BaseException:
+                await terminate_process(proc)
+                raise
+
             stderr_text = "\n".join(stderr_lines)
 
             if returncode != 0:

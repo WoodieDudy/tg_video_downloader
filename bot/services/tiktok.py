@@ -17,10 +17,12 @@ from bot.services.downloader import (
     ProgressCallback,
     StageCallback,
     VideoInfo,
+    communicate_with_timeout,
     compress_video_for_telegram,
     parse_progress_line,
     probe_media,
     summarize_video_formats,
+    terminate_process,
 )
 from bot.utils.parsers import TimeRange
 
@@ -64,11 +66,17 @@ class TikTokDownloader:
         downloads_dir: Path,
         *,
         max_file_size_bytes: int = 2000 * 1024 * 1024,
+        socket_timeout_seconds: int = 20,
+        fetch_timeout_seconds: int = 45,
+        download_timeout_seconds: int = 300,
         video_crf: int = 24,
         video_preset: str = "medium",
     ) -> None:
         self.downloads_dir = downloads_dir
         self.max_file_size_bytes = max_file_size_bytes
+        self.socket_timeout_seconds = socket_timeout_seconds
+        self.fetch_timeout_seconds = fetch_timeout_seconds
+        self.download_timeout_seconds = download_timeout_seconds
         self.video_crf = video_crf
         self.video_preset = video_preset
         self.downloads_dir.mkdir(parents=True, exist_ok=True)
@@ -227,16 +235,23 @@ class TikTokDownloader:
             "--no-playlist",
             "--no-warnings",
             "--no-colors",
-            "--dump-single-json",
-            url,
         ]
+        if self.socket_timeout_seconds > 0:
+            cmd.extend(["--socket-timeout", str(self.socket_timeout_seconds)])
+        cmd.extend(["--dump-single-json", url])
         for attempt in range(2):
             proc = await asyncio.create_subprocess_exec(
                 *cmd,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
-            stdout_b, stderr_b = await proc.communicate()
+            try:
+                stdout_b, stderr_b = await communicate_with_timeout(
+                    proc, self.fetch_timeout_seconds
+                )
+            except TimeoutError:
+                logger.warning("yt-dlp TikTok info attempt %d timed out", attempt + 1)
+                continue
             if proc.returncode == 0:
                 try:
                     return json.loads(stdout_b.decode("utf-8"))
@@ -277,6 +292,8 @@ class TikTokDownloader:
             "-o",
             output_template,
         ]
+        if self.socket_timeout_seconds > 0:
+            cmd.extend(["--socket-timeout", str(self.socket_timeout_seconds)])
 
         if is_audio:
             cmd.extend(
@@ -356,8 +373,24 @@ class TikTokDownloader:
                 if line:
                     stderr_lines.append(line)
 
-        await asyncio.gather(_read_stdout(), _read_stderr())
-        returncode = await proc.wait()
+        async def _wait_download() -> int:
+            await asyncio.gather(_read_stdout(), _read_stderr())
+            return await proc.wait()
+
+        try:
+            if self.download_timeout_seconds > 0:
+                returncode = await asyncio.wait_for(
+                    _wait_download(), timeout=self.download_timeout_seconds
+                )
+            else:
+                returncode = await _wait_download()
+        except TimeoutError:
+            await terminate_process(proc)
+            logger.warning("yt-dlp TikTok download timed out after %ds", self.download_timeout_seconds)
+            return None
+        except BaseException:
+            await terminate_process(proc)
+            raise
         if returncode != 0:
             logger.warning("yt-dlp TikTok download failed: %s", "\n".join(stderr_lines))
             return None

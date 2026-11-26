@@ -4,10 +4,28 @@ import asyncio
 import secrets
 import time
 from collections import defaultdict, deque
+from collections.abc import AsyncIterator, Awaitable, Callable
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 
 from bot.services.downloader import VideoInfo
 from bot.utils.parsers import TimeRange
+
+
+class QueueError(Exception):
+    """Base error raised by the global request queue."""
+
+
+class QueueFullError(QueueError):
+    """Raised when too many requests are already waiting in the global queue."""
+
+
+class QueueTimeoutError(QueueError):
+    """Raised when waiting for a free slot in the global queue exceeds timeout."""
+
+
+class TaskTimeoutError(QueueError):
+    """Raised when an active queued task exceeds its execution timeout."""
 
 
 @dataclass(slots=True)
@@ -57,13 +75,151 @@ class RateLimiter:
         return None
 
 
+class GlobalRequestQueue:
+    """Strict FIFO global queue for all users with wait/execution timeouts and pacing gap."""
+
+    def __init__(
+        self,
+        *,
+        max_concurrent: int = 1,
+        max_queue_size: int = 15,
+        wait_timeout_seconds: float = 120.0,
+        min_gap_seconds: float = 2.0,
+    ) -> None:
+        self.max_concurrent = max(1, max_concurrent)
+        self.max_queue_size = max(1, max_queue_size)
+        self.wait_timeout_seconds = max(0.01, float(wait_timeout_seconds))
+        self.min_gap_seconds = max(0.0, float(min_gap_seconds))
+        self._active = 0
+        self._waiters: deque[asyncio.Future[None]] = deque()
+        self._last_finished_at = 0.0
+
+    @property
+    def active_count(self) -> int:
+        return self._active
+
+    @property
+    def waiting_count(self) -> int:
+        return len(self._waiters)
+
+    @property
+    def is_busy(self) -> bool:
+        return self._active >= self.max_concurrent or bool(self._waiters)
+
+    async def acquire(
+        self,
+        *,
+        on_queued: Callable[[int], Awaitable[None]] | None = None,
+        wait_timeout: float | None = None,
+    ) -> None:
+        timeout = self.wait_timeout_seconds if wait_timeout is None else max(0.01, float(wait_timeout))
+
+        if self._active < self.max_concurrent and not self._waiters:
+            self._active += 1
+        else:
+            if len(self._waiters) >= self.max_queue_size:
+                raise QueueFullError(
+                    "⏳ Очередь переполнена, сейчас обрабатывается слишком много запросов. Попробуй через пару минут."
+                )
+
+            loop = asyncio.get_running_loop()
+            fut: asyncio.Future[None] = loop.create_future()
+            self._waiters.append(fut)
+            position = len(self._waiters)
+
+            if on_queued is not None:
+                try:
+                    await on_queued(position)
+                except Exception:
+                    pass
+
+            try:
+                await asyncio.wait_for(fut, timeout=timeout)
+            except TimeoutError as exc:
+                try:
+                    self._waiters.remove(fut)
+                except ValueError:
+                    pass
+                if fut.done() and not fut.cancelled():
+                    self.release()
+                raise QueueTimeoutError(
+                    f"⏳ Не удалось дождаться своей очереди за {int(round(timeout))} сек. "
+                    "Попробуй отправить запрос чуть позже."
+                ) from exc
+            except asyncio.CancelledError:
+                try:
+                    self._waiters.remove(fut)
+                except ValueError:
+                    pass
+                if fut.done() and not fut.cancelled():
+                    self.release()
+                raise
+
+        if self.min_gap_seconds > 0 and self._last_finished_at > 0:
+            remaining = self.min_gap_seconds - (time.monotonic() - self._last_finished_at)
+            if remaining > 0:
+                try:
+                    await asyncio.sleep(remaining)
+                except BaseException:
+                    self.release()
+                    raise
+
+    def release(self) -> None:
+        self._last_finished_at = time.monotonic()
+        self._active = max(0, self._active - 1)
+        while self._active < self.max_concurrent and self._waiters:
+            next_fut = self._waiters.popleft()
+            if not next_fut.done():
+                self._active += 1
+                next_fut.set_result(None)
+                break
+
+    @asynccontextmanager
+    async def slot(
+        self,
+        *,
+        on_queued: Callable[[int], Awaitable[None]] | None = None,
+        wait_timeout: float | None = None,
+        task_timeout: float | None = None,
+        task_timeout_message: str | None = None,
+    ) -> AsyncIterator[None]:
+        await self.acquire(on_queued=on_queued, wait_timeout=wait_timeout)
+        try:
+            if task_timeout is not None and task_timeout > 0:
+                try:
+                    async with asyncio.timeout(task_timeout):
+                        yield
+                except TimeoutError as exc:
+                    raise TaskTimeoutError(
+                        task_timeout_message
+                        or f"⏳ Задача выполнялась дольше {int(round(task_timeout))} сек. и была остановлена."
+                    ) from exc
+            else:
+                yield
+        finally:
+            self.release()
+
+
 class PendingJobStore:
     """In-memory store of pending download requests with automatic TTL expiration."""
 
-    def __init__(self, max_concurrent_downloads: int = 2, ttl_seconds: int = 7200) -> None:
+    def __init__(
+        self,
+        max_concurrent_downloads: int = 1,
+        ttl_seconds: int = 7200,
+        *,
+        queue_wait_timeout_seconds: float = 120.0,
+        queue_max_size: int = 15,
+        queue_task_gap_seconds: float = 2.0,
+    ) -> None:
         self._jobs: dict[str, PendingJob] = {}
         self._ttl_seconds = ttl_seconds
-        self.semaphore = asyncio.Semaphore(max(1, max_concurrent_downloads))
+        self.queue = GlobalRequestQueue(
+            max_concurrent=max_concurrent_downloads,
+            max_queue_size=queue_max_size,
+            wait_timeout_seconds=queue_wait_timeout_seconds,
+            min_gap_seconds=queue_task_gap_seconds,
+        )
 
     def create(
         self,

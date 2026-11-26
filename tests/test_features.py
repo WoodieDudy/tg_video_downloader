@@ -1,6 +1,9 @@
+import asyncio
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
+
+import pytest
 
 from aiogram.enums import ChatType
 from aiogram.types import CallbackQuery, Chat, ChatMemberUpdated, Message, MessageEntity, User
@@ -20,7 +23,14 @@ from bot.services.alerts import AdminAlertMonitor
 from bot.services.cache import CachedMedia, MediaCache
 from bot.services.chrome_cookies import SessionStatus
 from bot.services.downloader import AuthRequiredError, DownloadedMedia, VideoInfo, YouTubeDownloader
-from bot.services.jobs import PendingJobStore, RateLimiter
+from bot.services.jobs import (
+    GlobalRequestQueue,
+    PendingJobStore,
+    QueueFullError,
+    QueueTimeoutError,
+    RateLimiter,
+    TaskTimeoutError,
+)
 from bot.services.tiktok import parse_tikwm_payload
 from bot.utils.parsers import TimeRange, extract_tiktok_url, parse_tiktok_request
 
@@ -480,3 +490,69 @@ async def test_send_document_disables_type_detection_and_guards_cache(tmp_path: 
     assert repaired is not None
     assert repaired.media_kind == "document"
     assert repaired.file_id == "real_doc_file_id"
+
+
+async def test_global_request_queue_serializes_and_timeouts() -> None:
+    queue = GlobalRequestQueue(
+        max_concurrent=1,
+        max_queue_size=2,
+        wait_timeout_seconds=0.12,
+        min_gap_seconds=0.0,
+    )
+
+    events: list[str] = []
+    positions: list[int] = []
+    release_first = asyncio.Event()
+
+    async def _worker_first() -> None:
+        async with queue.slot():
+            events.append("start_1")
+            await release_first.wait()
+            events.append("end_1")
+
+    async def _worker_queued(name: str) -> None:
+        async def _on_q(pos: int) -> None:
+            positions.append(pos)
+
+        async with queue.slot(on_queued=_on_q, wait_timeout=1.0):
+            events.append(f"start_{name}")
+            await asyncio.sleep(0.01)
+            events.append(f"end_{name}")
+
+    t1 = asyncio.create_task(_worker_first())
+    await asyncio.sleep(0.01)
+
+    t2 = asyncio.create_task(_worker_queued("2"))
+    t3 = asyncio.create_task(_worker_queued("3"))
+    await asyncio.sleep(0.01)
+
+    # Queue is full (max_queue_size=2): 4th caller fails immediately
+    with pytest.raises(QueueFullError):
+        async with queue.slot():
+            pass
+
+    # Wait timeout test on a separate waiter while queue holds slot
+    short_queue = GlobalRequestQueue(
+        max_concurrent=1,
+        max_queue_size=5,
+        wait_timeout_seconds=0.05,
+        min_gap_seconds=0.0,
+    )
+    async with short_queue.slot():
+        with pytest.raises(QueueTimeoutError):
+            async with short_queue.slot():
+                pass
+
+    # Release 1st task -> queued tasks run strictly in FIFO order, never overlapping
+    release_first.set()
+    await asyncio.gather(t1, t2, t3)
+    assert events == ["start_1", "end_1", "start_2", "end_2", "start_3", "end_3"]
+    assert positions == [1, 2]
+
+    # Task execution timeout releases slot for subsequent requests
+    with pytest.raises(TaskTimeoutError):
+        async with queue.slot(task_timeout=0.05):
+            await asyncio.sleep(0.2)
+
+    assert queue.active_count == 0
+    assert queue.waiting_count == 0

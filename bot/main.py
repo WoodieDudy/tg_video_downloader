@@ -147,6 +147,9 @@ async def run() -> None:
         pot_provider_url=settings.pot_provider_url,
         sleep_requests=settings.ytdlp_sleep_requests,
         concurrent_fragments=settings.ytdlp_concurrent_fragments,
+        socket_timeout_seconds=settings.ytdlp_socket_timeout_seconds,
+        fetch_timeout_seconds=settings.fetch_info_timeout_seconds,
+        download_timeout_seconds=settings.download_timeout_seconds,
         video_crf=settings.video_crf,
         video_preset=settings.video_preset,
     )
@@ -159,10 +162,18 @@ async def run() -> None:
     tiktok_downloader = TikTokDownloader(
         downloads_dir=settings.downloads_dir,
         max_file_size_bytes=settings.max_file_size_bytes,
+        socket_timeout_seconds=settings.ytdlp_socket_timeout_seconds,
+        fetch_timeout_seconds=settings.fetch_info_timeout_seconds,
+        download_timeout_seconds=settings.download_timeout_seconds,
         video_crf=settings.video_crf,
         video_preset=settings.video_preset,
     )
-    job_store = PendingJobStore(max_concurrent_downloads=settings.max_concurrent_downloads)
+    job_store = PendingJobStore(
+        max_concurrent_downloads=settings.max_concurrent_downloads,
+        queue_wait_timeout_seconds=settings.queue_wait_timeout_seconds,
+        queue_max_size=settings.queue_max_size,
+        queue_task_gap_seconds=settings.queue_task_gap_seconds,
+    )
     rate_limiter = RateLimiter(
         cooldown_seconds=settings.user_cooldown_seconds,
         hourly_limit=settings.user_hourly_limit,

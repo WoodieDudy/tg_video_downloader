@@ -8,6 +8,7 @@ Telegram-бот для скачивания видео с YouTube, YouTube Short
 - **Постоянная сессия Google в headless Chromium**: первичная авторизация выполняется один раз в запасной Google-аккаунт через встроенный **noVNC**; профиль сохраняется в Docker volume, а cookies регулярно обновляются через CDP (`Network.getAllCookies`) и автоматически перевыгружаются при ошибках авторизации.
 - **Защита YouTube-аккаунта от блокировки**:
   - встроенный sidecar **`bgutil-pot-provider`** (PO Token): публичные видео сначала скачиваются **без cookies**, а Chrome-сессия подключается только при необходимости (18+, bot-check);
+  - общая FIFO-очередь на все запросы (получение метаданных и скачивания от всех пользователей выполняются строго по одному через `MAX_CONCURRENT_DOWNLOADS=1` с паузой `QUEUE_TASK_GAP_SECONDS=2.0`, лимитом очереди `QUEUE_MAX_SIZE=15` и таймаутами `QUEUE_WAIT_TIMEOUT_SECONDS=120`, `FETCH_INFO_TIMEOUT_SECONDS=45`, `DOWNLOAD_TIMEOUT_SECONDS=300`, `--socket-timeout 20`);
   - переиспользование `info.json` (`--load-info-json`) — вдвое меньше обращений к YouTube;
   - фоновое обновление cookies раз в 4 часа (`COOKIE_REFRESH_INTERVAL_MINUTES=240`), паузы `--sleep-requests 1` и антиспам-лимит для не-админов (`USER_COOLDOWN_SECONDS=20`, `USER_HOURLY_LIMIT=20`).
 - **Лимиты для групповых чатов**: в группах не скачиваются видео длиннее **2 минут** (`GROUP_MAX_DURATION_SECONDS=120`), прямые трансляции и файлы больше **150 МБ** (`GROUP_MAX_FILE_SIZE_MB=150`).

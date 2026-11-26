@@ -15,6 +15,7 @@ from bot.config import Settings
 from bot.services.access import AccessManager
 from bot.services.cache import MediaCache
 from bot.services.chrome_cookies import ChromeSessionManager, SessionStatus
+from bot.services.jobs import PendingJobStore
 from bot.utils.parsers import format_filesize
 
 logger = logging.getLogger(__name__)
@@ -25,6 +26,7 @@ def _format_status(
     status: SessionStatus,
     settings: Settings,
     media_cache: MediaCache | None = None,
+    job_store: PendingJobStore | None = None,
 ) -> str:
     browser_icon = "🟢 Работает" if status.browser_running else "🔴 Остановлен"
     auth_icon = (
@@ -51,6 +53,12 @@ def _format_status(
     ]
     if media_cache is not None:
         lines.append(f"🗄 <b>Кэш file_id:</b> {media_cache.count} записей")
+    if job_store is not None:
+        q = job_store.queue
+        lines.append(
+            f"🚦 <b>Общая очередь:</b> активно {q.active_count}/{q.max_concurrent}, "
+            f"в ожидании {q.waiting_count}/{q.max_queue_size}"
+        )
     if status.last_error:
         lines.append(f"\n⚠️ <b>Последняя ошибка:</b> <code>{html.escape(status.last_error)}</code>")
     return "\n".join(lines)
@@ -205,9 +213,10 @@ async def cmd_status(
     cookie_manager: ChromeSessionManager,
     media_cache: MediaCache,
     settings: Settings,
+    job_store: PendingJobStore | None = None,
 ) -> None:
     await message.answer(
-        _format_status(cookie_manager.status, settings, media_cache),
+        _format_status(cookie_manager.status, settings, media_cache, job_store),
         parse_mode="HTML",
     )
 
@@ -233,6 +242,7 @@ async def cmd_refresh_cookies(
     access_manager: AccessManager,
     media_cache: MediaCache,
     settings: Settings,
+    job_store: PendingJobStore | None = None,
 ) -> None:
     if not message.from_user or not access_manager.is_admin(message.from_user.id):
         await message.answer("⛔ Команда доступна только администратору.")
@@ -241,7 +251,7 @@ async def cmd_refresh_cookies(
     wait_msg = await message.answer("🔄 Обновляю страницу YouTube в headless Chrome и выгружаю cookies...")
     try:
         status = await cookie_manager.refresh_cookies(navigate=True)
-        await wait_msg.edit_text(_format_status(status, settings, media_cache), parse_mode="HTML")
+        await wait_msg.edit_text(_format_status(status, settings, media_cache, job_store), parse_mode="HTML")
     except Exception as exc:
         await wait_msg.edit_text(
             f"❌ Не удалось обновить cookies:\n<code>{html.escape(str(exc))}</code>",

@@ -5,6 +5,7 @@ import html
 import logging
 import re
 import time
+from collections.abc import Awaitable, Callable
 from typing import Any
 
 from aiogram import Bot, F, Router
@@ -30,10 +31,11 @@ from bot.services.downloader import (
     DownloadedMedia,
     DownloadProgress,
     FileTooLargeError,
+    VideoInfo,
     YouTubeDownloader,
 )
 from bot.services.instagram import InstagramDownloader
-from bot.services.jobs import PendingJob, PendingJobStore, RateLimiter
+from bot.services.jobs import PendingJob, PendingJobStore, QueueError, RateLimiter
 from bot.services.tiktok import TikTokDownloader
 from bot.utils.parsers import (
     TimeRange,
@@ -516,13 +518,31 @@ async def handle_group_shorts(
 
     max_group_dur = settings.group_max_duration_seconds if settings else 120
     max_group_bytes = settings.group_max_file_size_bytes if settings else 150 * 1024 * 1024
+    group_task_timeout = (
+        float(settings.fetch_info_timeout_seconds + settings.download_timeout_seconds)
+        if settings
+        else 345.0
+    )
     sender_id = message.from_user.id if message.from_user else 0
     sender_is_admin = bool(access_manager and sender_id and access_manager.is_admin(sender_id))
 
     status_msg = await message.reply(f"⏳ Скачиваю {label}...")
+    queued_notice_shown = False
+
+    async def _on_group_queued(pos: int) -> None:
+        nonlocal queued_notice_shown
+        queued_notice_shown = True
+        await _safe_edit(status_msg, f"🚦 В очереди (#{pos}) для {label}...")
+
     media: DownloadedMedia | None = None
     try:
-        async with job_store.semaphore:
+        async with job_store.queue.slot(
+            on_queued=_on_group_queued,
+            task_timeout=group_task_timeout,
+            task_timeout_message=f"⏳ Превышено время обработки {label}. Попробуй позже.",
+        ):
+            if queued_notice_shown:
+                await _safe_edit(status_msg, f"⏳ Скачиваю {label}...")
             async def _on_group_stage(stage: str) -> None:
                 if stage == "compressing":
                     await _safe_edit(status_msg, f"🗜 Сжимаю {label} для Telegram...")
@@ -718,6 +738,8 @@ async def handle_group_shorts(
             await status_msg.delete()
         except TelegramBadRequest:
             pass
+    except QueueError as exc:
+        await _safe_edit(status_msg, html.escape(str(exc)))
     except AuthRequiredError:
         await _safe_edit(
             status_msg,
@@ -743,6 +765,33 @@ async def handle_group_shorts(
             media.cleanup()
 
 
+async def _fetch_in_queue(
+    *,
+    job_store: PendingJobStore,
+    status_msg: Message,
+    fetch_coro_factory: Callable[[], Awaitable[VideoInfo]],
+    active_text: str,
+    settings: Settings | None = None,
+) -> VideoInfo:
+    """Serialize metadata lookup through the global FIFO queue with position feedback."""
+    fetch_timeout = float(settings.fetch_info_timeout_seconds) if settings else 45.0
+    queued = False
+
+    async def _on_queued(pos: int) -> None:
+        nonlocal queued
+        queued = True
+        await _safe_edit(status_msg, f"🚦 В очереди на получение данных (#{pos})...")
+
+    async with job_store.queue.slot(
+        on_queued=_on_queued,
+        task_timeout=fetch_timeout,
+        task_timeout_message=f"⏳ Превышено время получения данных о видео ({int(fetch_timeout)} сек.).",
+    ):
+        if queued:
+            await _safe_edit(status_msg, active_text)
+        return await fetch_coro_factory()
+
+
 @router.message(
     F.chat.type == ChatType.PRIVATE,
     F.text.func(lambda txt: bool(txt and extract_youtube_url(txt))),
@@ -752,6 +801,7 @@ async def handle_youtube_link(
     state: FSMContext,
     downloader: YouTubeDownloader,
     job_store: PendingJobStore,
+    settings: Settings | None = None,
 ) -> None:
     await state.clear()
     assert message.text is not None
@@ -765,10 +815,19 @@ async def handle_youtube_link(
     status_msg = await message.answer("🔍 Получаю информацию о видео...")
 
     try:
-        info = await downloader.fetch_info(
-            parsed.video.canonical_url,
-            is_shorts=parsed.video.is_shorts,
+        info = await _fetch_in_queue(
+            job_store=job_store,
+            status_msg=status_msg,
+            active_text="🔍 Получаю информацию о видео...",
+            settings=settings,
+            fetch_coro_factory=lambda: downloader.fetch_info(
+                parsed.video.canonical_url,
+                is_shorts=parsed.video.is_shorts,
+            ),
         )
+    except QueueError as exc:
+        await _safe_edit(status_msg, html.escape(str(exc)))
+        return
     except AuthRequiredError as exc:
         await _safe_edit(
             status_msg,
@@ -827,6 +886,7 @@ async def handle_instagram_link(
     state: FSMContext,
     ig_downloader: InstagramDownloader,
     job_store: PendingJobStore,
+    settings: Settings | None = None,
 ) -> None:
     await state.clear()
     assert message.text is not None
@@ -838,11 +898,21 @@ async def handle_instagram_link(
         return
 
     status_msg = await message.answer("🔍 Получаю данные Instagram Reels...")
-    info = await ig_downloader.fetch_info(
-        shortcode=parsed.media.shortcode,
-        kind=parsed.media.kind,
-        canonical_url=parsed.media.canonical_url,
-    )
+    try:
+        info = await _fetch_in_queue(
+            job_store=job_store,
+            status_msg=status_msg,
+            active_text="🔍 Получаю данные Instagram Reels...",
+            settings=settings,
+            fetch_coro_factory=lambda: ig_downloader.fetch_info(
+                shortcode=parsed.media.shortcode,
+                kind=parsed.media.kind,
+                canonical_url=parsed.media.canonical_url,
+            ),
+        )
+    except QueueError as exc:
+        await _safe_edit(status_msg, html.escape(str(exc)))
+        return
 
     job = job_store.create(
         user_id=message.from_user.id,
@@ -869,6 +939,7 @@ async def handle_tiktok_link(
     state: FSMContext,
     tiktok_downloader: TikTokDownloader,
     job_store: PendingJobStore,
+    settings: Settings | None = None,
 ) -> None:
     await state.clear()
     assert message.text is not None
@@ -881,7 +952,18 @@ async def handle_tiktok_link(
 
     status_msg = await message.answer("🔍 Получаю информацию о TikTok...")
     try:
-        info = await tiktok_downloader.fetch_info(parsed.media.canonical_url)
+        info = await _fetch_in_queue(
+            job_store=job_store,
+            status_msg=status_msg,
+            active_text="🔍 Получаю информацию о TikTok...",
+            settings=settings,
+            fetch_coro_factory=lambda: tiktok_downloader.fetch_info(
+                parsed.media.canonical_url
+            ),
+        )
+    except QueueError as exc:
+        await _safe_edit(status_msg, html.escape(str(exc)))
+        return
     except DownloadError as exc:
         await _safe_edit(
             status_msg,
@@ -1063,6 +1145,7 @@ async def cb_download(
     job_store: PendingJobStore,
     access_manager: AccessManager | None = None,
     rate_limiter: RateLimiter | None = None,
+    settings: Settings | None = None,
 ) -> None:
     parts = (callback.data or "").split(":")
     if len(parts) != 3:
@@ -1092,9 +1175,6 @@ async def cb_download(
         quality_label += " (файлом)"
     trim_info = f"\n✂️ Отрезок: <code>{job.time_range.label()}</code>" if job.time_range else ""
     header = f"🎬 <b>{html.escape(job.info.title)}</b>\n⚙️ Режим: {quality_label}{trim_info}"
-
-    if job_store.semaphore.locked():
-        await _safe_edit(status_msg, f"{header}\n\n⏳ В очереди на скачивание...")
 
     last_update_ts = 0.0
 
@@ -1164,9 +1244,21 @@ async def cb_download(
             await _safe_edit(status_msg, f"{header}\n\n{limit_err}")
             return
 
+    dl_timeout = float(settings.download_timeout_seconds) if settings else 300.0
+
+    async def _on_dl_queued(pos: int) -> None:
+        await _safe_edit(status_msg, f"{header}\n\n🚦 В очереди на скачивание (#{pos})...")
+
     media = None
     try:
-        async with job_store.semaphore:
+        async with job_store.queue.slot(
+            on_queued=_on_dl_queued,
+            task_timeout=dl_timeout,
+            task_timeout_message=(
+                f"⏳ Скачивание заняло дольше {int(dl_timeout)} сек. и было остановлено. "
+                "Попробуй качество пониже или короткий отрезок."
+            ),
+        ):
             await _safe_edit(status_msg, f"{header}\n\n⬇️ Начинаю скачивание...")
             should_compress = not send_as_document and download_quality != "audio"
             if job.platform == "instagram":
@@ -1255,6 +1347,8 @@ async def cb_download(
         except TelegramBadRequest:
             pass
 
+    except QueueError as exc:
+        await _safe_edit(status_msg, f"{header}\n\n{html.escape(str(exc))}")
     except FileTooLargeError as exc:
         await _safe_edit(
             status_msg,
