@@ -8,7 +8,8 @@ import pytest
 from aiogram.enums import ChatType
 from aiogram.types import CallbackQuery, Chat, ChatMemberUpdated, Message, MessageEntity, User
 
-from bot.handlers.commands import cmd_start, on_added_to_group
+from bot.config import Settings
+from bot.handlers.commands import cmd_start, cmd_status, on_added_to_group
 from bot.handlers.youtube import (
     _has_supported_media_url,
     _is_group_auto_media,
@@ -299,6 +300,19 @@ async def test_separate_help_for_private_and_group(tmp_path: Path) -> None:
     pm_help = pm_msg.answer.call_args.args[0]
     assert "личных сообщениях" in pm_help
     assert "Админ-команды" in pm_help
+    assert "/status" in pm_help
+
+    user_pm_msg = MagicMock(spec=Message)
+    user_pm_msg.chat = MagicMock(spec=Chat, id=200, type=ChatType.PRIVATE)
+    user_pm_msg.from_user = MagicMock(spec=User, id=200)
+    user_pm_msg.answer = AsyncMock()
+
+    await cmd_start(user_pm_msg, state, access, bot_username="example_bot")
+    user_help = user_pm_msg.answer.call_args.args[0]
+    assert "личных сообщениях" in user_help
+    assert "Админ-команды" not in user_help
+    assert "/status" not in user_help
+    assert "/cancel" in user_help
 
 
 def test_rate_limiter_and_group_duration_limits() -> None:
@@ -556,3 +570,42 @@ async def test_global_request_queue_serializes_and_timeouts() -> None:
 
     assert queue.active_count == 0
     assert queue.waiting_count == 0
+
+
+async def test_status_is_admin_only(tmp_path: Path) -> None:
+    access = AccessManager(tmp_path / "users.json", admin_ids={100}, seed_allowed_ids={200})
+    cookie_mgr = SimpleNamespace(
+        status=SessionStatus(
+            browser_running=True,
+            authenticated=True,
+            total_cookies=20,
+            youtube_cookies=10,
+            last_refresh_at=None,
+            last_error=None,
+            cookies_file_exists=True,
+        )
+    )
+    media_cache = MediaCache(tmp_path / "cache.json")
+    settings = Settings(
+        _env_file=None,
+        bot_token="123:ABC",
+        downloads_dir=tmp_path,
+    )
+    job_store = PendingJobStore()
+
+    user_msg = MagicMock(spec=Message)
+    user_msg.from_user = MagicMock(spec=User, id=200)
+    user_msg.answer = AsyncMock()
+
+    await cmd_status(user_msg, cookie_mgr, access, media_cache, settings, job_store)
+    user_msg.answer.assert_awaited_once()
+    assert "только администратору" in user_msg.answer.call_args.args[0]
+
+    admin_msg = MagicMock(spec=Message)
+    admin_msg.from_user = MagicMock(spec=User, id=100)
+    admin_msg.answer = AsyncMock()
+
+    await cmd_status(admin_msg, cookie_mgr, access, media_cache, settings, job_store)
+    admin_msg.answer.assert_awaited_once()
+    assert "Статус бота" in admin_msg.answer.call_args.args[0]
+    assert "Общая очередь" in admin_msg.answer.call_args.args[0]

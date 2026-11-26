@@ -155,12 +155,12 @@ def _build_private_help(*, is_admin: bool) -> str:
         "  <code>https://youtu.be/... 01:15-02:30</code>\n"
         "  или нажми кнопку <b>✂️ Обрезать</b>.\n\n"
         "<b>Команды:</b>\n"
-        "/status — статус headless Chrome, сессии Google, кэша и диска\n"
         "/cancel — отменить ввод таймкода"
     )
     if is_admin:
         text += (
             "\n\n<b>Админ-команды:</b>\n"
+            "/status — статус headless Chrome, сессии Google, кэша, очереди и диска\n"
             "/refresh_cookies — обновить cookies из Chrome\n"
             "/clear_cache — очистить кэш Telegram file_id\n"
             "/add @username — разрешить доступ пользователю по @username или ID\n"
@@ -211,10 +211,15 @@ async def cmd_cancel(message: Message, state: FSMContext) -> None:
 async def cmd_status(
     message: Message,
     cookie_manager: ChromeSessionManager,
+    access_manager: AccessManager,
     media_cache: MediaCache,
     settings: Settings,
     job_store: PendingJobStore | None = None,
 ) -> None:
+    if not message.from_user or not access_manager.is_admin(message.from_user.id):
+        await message.answer("⛔ Команда доступна только администратору.")
+        return
+
     await message.answer(
         _format_status(cookie_manager.status, settings, media_cache, job_store),
         parse_mode="HTML",

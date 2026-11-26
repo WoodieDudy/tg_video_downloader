@@ -12,7 +12,12 @@ from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.client.telegram import TelegramAPIServer
 from aiogram.enums import ParseMode
 from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.types import BotCommand, BotCommandScopeAllGroupChats, BotCommandScopeDefault
+from aiogram.types import (
+    BotCommand,
+    BotCommandScopeAllGroupChats,
+    BotCommandScopeChat,
+    BotCommandScopeDefault,
+)
 
 from bot.config import Settings, load_settings
 from bot.handlers import commands, youtube
@@ -87,13 +92,13 @@ def cleanup_stale_downloads(downloads_dir: Path) -> None:
             logger.warning("Could not clean stale download %s: %s", item, exc)
 
 
-async def register_commands(bot: Bot) -> None:
-    """Register bot commands so /dl appears in Telegram group & PM autocomplete."""
+async def register_commands(bot: Bot, admin_ids: set[int] | None = None) -> None:
+    """Register bot commands for default users, groups, and admin private chats."""
     try:
         await bot.set_my_commands(
             [
                 BotCommand(command="dl", description="Скачать видео / Shorts / Reels / TikTok"),
-                BotCommand(command="status", description="Статус бота и Chrome-сессии"),
+                BotCommand(command="cancel", description="Отменить ввод таймкода"),
                 BotCommand(command="help", description="Справка"),
             ],
             scope=BotCommandScopeDefault(),
@@ -105,6 +110,19 @@ async def register_commands(bot: Bot) -> None:
             ],
             scope=BotCommandScopeAllGroupChats(),
         )
+        for admin_id in sorted(admin_ids or set()):
+            try:
+                await bot.set_my_commands(
+                    [
+                        BotCommand(command="dl", description="Скачать видео / Shorts / Reels / TikTok"),
+                        BotCommand(command="status", description="Статус бота и Chrome-сессии"),
+                        BotCommand(command="cancel", description="Отменить ввод таймкода"),
+                        BotCommand(command="help", description="Справка"),
+                    ],
+                    scope=BotCommandScopeChat(chat_id=admin_id),
+                )
+            except Exception as exc:
+                logger.debug("Failed to set admin commands for chat_id=%s: %s", admin_id, exc)
     except Exception as exc:
         logger.warning("Failed to set bot commands: %s", exc)
 
@@ -204,7 +222,7 @@ async def run() -> None:
         dp["bot_username"] = (
             settings.bot_username.strip().lstrip("@").lower() or detected_username
         )
-        await register_commands(bot)
+        await register_commands(bot, admin_ids=access_manager.admin_ids)
         await alert_monitor.evaluate(cookie_manager.status)
         await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
     finally:
