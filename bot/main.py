@@ -98,6 +98,7 @@ async def register_commands(bot: Bot, admin_ids: set[int] | None = None) -> None
         await bot.set_my_commands(
             [
                 BotCommand(command="dl", description="Скачать видео / Shorts / Reels / TikTok"),
+                BotCommand(command="stop", description="Остановить текущее скачивание"),
                 BotCommand(command="cancel", description="Отменить ввод таймкода"),
                 BotCommand(command="help", description="Справка"),
             ],
@@ -116,6 +117,7 @@ async def register_commands(bot: Bot, admin_ids: set[int] | None = None) -> None
                     [
                         BotCommand(command="dl", description="Скачать видео / Shorts / Reels / TikTok"),
                         BotCommand(command="status", description="Статус бота и Chrome-сессии"),
+                        BotCommand(command="stop", description="Остановить текущее скачивание"),
                         BotCommand(command="cancel", description="Отменить ввод таймкода"),
                         BotCommand(command="help", description="Справка"),
                     ],

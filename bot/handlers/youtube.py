@@ -35,7 +35,13 @@ from bot.services.downloader import (
     YouTubeDownloader,
 )
 from bot.services.instagram import InstagramDownloader
-from bot.services.jobs import PendingJob, PendingJobStore, QueueError, RateLimiter
+from bot.services.jobs import (
+    ActiveDownloadTask,
+    PendingJob,
+    PendingJobStore,
+    QueueError,
+    RateLimiter,
+)
 from bot.services.tiktok import TikTokDownloader
 from bot.utils.parsers import (
     TimeRange,
@@ -535,209 +541,215 @@ async def handle_group_shorts(
         await _safe_edit(status_msg, f"🚦 В очереди (#{pos}) для {label}...")
 
     media: DownloadedMedia | None = None
+    active_task: ActiveDownloadTask | None = None
     try:
-        async with job_store.queue.slot(
-            on_queued=_on_group_queued,
-            task_timeout=group_task_timeout,
-            task_timeout_message=f"⏳ Превышено время обработки {label}. Попробуй позже.",
-        ):
-            if queued_notice_shown:
-                await _safe_edit(status_msg, f"⏳ Скачиваю {label}...")
-            async def _on_group_stage(stage: str) -> None:
-                if stage == "compressing":
-                    await _safe_edit(status_msg, f"🗜 Сжимаю {label} для Telegram...")
+        async with job_store.track_active_task(
+            user_id=sender_id,
+            chat_id=message.chat.id,
+            description=label,
+        ) as active_task:
+            async with job_store.queue.slot(
+                on_queued=_on_group_queued,
+                task_timeout=group_task_timeout,
+                task_timeout_message=f"⏳ Превышено время обработки {label}. Попробуй позже.",
+            ):
+                if queued_notice_shown:
+                    await _safe_edit(status_msg, f"⏳ Скачиваю {label}...")
+                async def _on_group_stage(stage: str) -> None:
+                    if stage == "compressing":
+                        await _safe_edit(status_msg, f"🗜 Сжимаю {label} для Telegram...")
 
-            if platform == "instagram":
-                assert ig_parsed is not None
-                validated_range = ig_parsed.time_range
-                cache_key = MediaCache.make_key(
-                    platform="instagram",
-                    video_id=ig_parsed.media.shortcode,
-                    quality="best",
-                    as_document=False,
-                    time_range=validated_range,
-                )
-                if await _try_group_cache_hit(
-                    bot=bot,
-                    message=message,
-                    status_msg=status_msg,
-                    media_cache=media_cache,
-                    cache_key=cache_key,
-                    badge=badge,
-                    time_range=validated_range,
-                ):
-                    return
-
-                if dur_err := check_group_duration_limit(
-                    None, validated_range, max_duration_seconds=max_group_dur
-                ):
-                    await _safe_edit(status_msg, dur_err)
-                    return
-
-                if rate_limiter is not None and sender_id:
-                    if limit_err := rate_limiter.check_and_record(
-                        sender_id, is_admin=sender_is_admin
+                if platform == "instagram":
+                    assert ig_parsed is not None
+                    validated_range = ig_parsed.time_range
+                    cache_key = MediaCache.make_key(
+                        platform="instagram",
+                        video_id=ig_parsed.media.shortcode,
+                        quality="best",
+                        as_document=False,
+                        time_range=validated_range,
+                    )
+                    if await _try_group_cache_hit(
+                        bot=bot,
+                        message=message,
+                        status_msg=status_msg,
+                        media_cache=media_cache,
+                        cache_key=cache_key,
+                        badge=badge,
+                        time_range=validated_range,
                     ):
-                        await _safe_edit(status_msg, limit_err)
                         return
 
-                media = await ig_downloader.download(
-                    shortcode=ig_parsed.media.shortcode,
-                    kind=ig_parsed.media.kind,
-                    canonical_url=ig_parsed.media.canonical_url,
-                    quality="best",
-                    time_range=validated_range,
-                    compress=True,
-                    on_stage=_on_group_stage,
-                )
-                title = media.title
-                uploader = media.uploader
-
-            elif platform == "tiktok":
-                assert tt_parsed is not None
-                info = await tiktok_downloader.fetch_info(tt_parsed.media.canonical_url)
-                validated_range = _clamp_time_range(tt_parsed.time_range, info.duration)
-                cache_key = MediaCache.make_key(
-                    platform="tiktok",
-                    video_id=info.video_id or tt_parsed.media.canonical_url,
-                    quality="best",
-                    as_document=False,
-                    time_range=validated_range,
-                )
-                if await _try_group_cache_hit(
-                    bot=bot,
-                    message=message,
-                    status_msg=status_msg,
-                    media_cache=media_cache,
-                    cache_key=cache_key,
-                    badge=badge,
-                    time_range=validated_range,
-                ):
-                    return
-
-                if dur_err := check_group_duration_limit(
-                    info.duration,
-                    validated_range,
-                    is_live=info.is_live,
-                    max_duration_seconds=max_group_dur,
-                ):
-                    await _safe_edit(status_msg, dur_err)
-                    return
-
-                if rate_limiter is not None and sender_id:
-                    if limit_err := rate_limiter.check_and_record(
-                        sender_id, is_admin=sender_is_admin
+                    if dur_err := check_group_duration_limit(
+                        None, validated_range, max_duration_seconds=max_group_dur
                     ):
-                        await _safe_edit(status_msg, limit_err)
+                        await _safe_edit(status_msg, dur_err)
                         return
 
-                media = await tiktok_downloader.download(
-                    info.webpage_url,
-                    quality="best",
-                    is_portrait=info.is_portrait,
-                    time_range=validated_range,
-                    compress=True,
-                    on_stage=_on_group_stage,
-                )
-                title = info.title
-                uploader = info.uploader
+                    if rate_limiter is not None and sender_id:
+                        if limit_err := rate_limiter.check_and_record(
+                            sender_id, is_admin=sender_is_admin
+                        ):
+                            await _safe_edit(status_msg, limit_err)
+                            return
 
-            else:
-                assert yt_parsed is not None
-                info = await downloader.fetch_info(
-                    yt_parsed.video.canonical_url,
-                    is_shorts=yt_parsed.video.is_shorts,
-                )
-                validated_range = _clamp_time_range(yt_parsed.time_range, info.duration)
-                cache_key = MediaCache.make_key(
-                    platform="youtube",
-                    video_id=info.video_id,
-                    quality="best",
-                    as_document=False,
-                    time_range=validated_range,
-                )
-                if await _try_group_cache_hit(
-                    bot=bot,
-                    message=message,
-                    status_msg=status_msg,
-                    media_cache=media_cache,
-                    cache_key=cache_key,
-                    badge=badge,
-                    time_range=validated_range,
-                ):
-                    return
+                    media = await ig_downloader.download(
+                        shortcode=ig_parsed.media.shortcode,
+                        kind=ig_parsed.media.kind,
+                        canonical_url=ig_parsed.media.canonical_url,
+                        quality="best",
+                        time_range=validated_range,
+                        compress=True,
+                        on_stage=_on_group_stage,
+                    )
+                    title = media.title
+                    uploader = media.uploader
 
-                if dur_err := check_group_duration_limit(
-                    info.duration,
-                    validated_range,
-                    is_live=info.is_live,
-                    max_duration_seconds=max_group_dur,
-                ):
-                    await _safe_edit(status_msg, dur_err)
-                    return
-
-                if rate_limiter is not None and sender_id:
-                    if limit_err := rate_limiter.check_and_record(
-                        sender_id, is_admin=sender_is_admin
+                elif platform == "tiktok":
+                    assert tt_parsed is not None
+                    info = await tiktok_downloader.fetch_info(tt_parsed.media.canonical_url)
+                    validated_range = _clamp_time_range(tt_parsed.time_range, info.duration)
+                    cache_key = MediaCache.make_key(
+                        platform="tiktok",
+                        video_id=info.video_id or tt_parsed.media.canonical_url,
+                        quality="best",
+                        as_document=False,
+                        time_range=validated_range,
+                    )
+                    if await _try_group_cache_hit(
+                        bot=bot,
+                        message=message,
+                        status_msg=status_msg,
+                        media_cache=media_cache,
+                        cache_key=cache_key,
+                        badge=badge,
+                        time_range=validated_range,
                     ):
-                        await _safe_edit(status_msg, limit_err)
                         return
 
-                media = await downloader.download(
-                    info.webpage_url,
-                    quality="best",
-                    is_portrait=info.is_portrait,
-                    time_range=validated_range,
-                    compress=True,
-                    on_stage=_on_group_stage,
+                    if dur_err := check_group_duration_limit(
+                        info.duration,
+                        validated_range,
+                        is_live=info.is_live,
+                        max_duration_seconds=max_group_dur,
+                    ):
+                        await _safe_edit(status_msg, dur_err)
+                        return
+
+                    if rate_limiter is not None and sender_id:
+                        if limit_err := rate_limiter.check_and_record(
+                            sender_id, is_admin=sender_is_admin
+                        ):
+                            await _safe_edit(status_msg, limit_err)
+                            return
+
+                    media = await tiktok_downloader.download(
+                        info.webpage_url,
+                        quality="best",
+                        is_portrait=info.is_portrait,
+                        time_range=validated_range,
+                        compress=True,
+                        on_stage=_on_group_stage,
+                    )
+                    title = info.title
+                    uploader = info.uploader
+
+                else:
+                    assert yt_parsed is not None
+                    info = await downloader.fetch_info(
+                        yt_parsed.video.canonical_url,
+                        is_shorts=yt_parsed.video.is_shorts,
+                    )
+                    validated_range = _clamp_time_range(yt_parsed.time_range, info.duration)
+                    cache_key = MediaCache.make_key(
+                        platform="youtube",
+                        video_id=info.video_id,
+                        quality="best",
+                        as_document=False,
+                        time_range=validated_range,
+                    )
+                    if await _try_group_cache_hit(
+                        bot=bot,
+                        message=message,
+                        status_msg=status_msg,
+                        media_cache=media_cache,
+                        cache_key=cache_key,
+                        badge=badge,
+                        time_range=validated_range,
+                    ):
+                        return
+
+                    if dur_err := check_group_duration_limit(
+                        info.duration,
+                        validated_range,
+                        is_live=info.is_live,
+                        max_duration_seconds=max_group_dur,
+                    ):
+                        await _safe_edit(status_msg, dur_err)
+                        return
+
+                    if rate_limiter is not None and sender_id:
+                        if limit_err := rate_limiter.check_and_record(
+                            sender_id, is_admin=sender_is_admin
+                        ):
+                            await _safe_edit(status_msg, limit_err)
+                            return
+
+                    media = await downloader.download(
+                        info.webpage_url,
+                        quality="best",
+                        is_portrait=info.is_portrait,
+                        time_range=validated_range,
+                        compress=True,
+                        on_stage=_on_group_stage,
+                    )
+                    title = info.title
+                    uploader = info.uploader
+
+            if dur_err := check_group_duration_limit(
+                media.duration, validated_range, max_duration_seconds=max_group_dur
+            ):
+                await _safe_edit(status_msg, dur_err)
+                return
+
+            if max_group_bytes > 0 and media.size_bytes > max_group_bytes:
+                await _safe_edit(
+                    status_msg,
+                    f"📦 Видео ({format_filesize(media.size_bytes)}) превышает лимит для групповых чатов "
+                    f"({format_filesize(max_group_bytes)}). Отправь ссылку мне в личку.",
                 )
-                title = info.title
-                uploader = info.uploader
+                return
 
-        if dur_err := check_group_duration_limit(
-            media.duration, validated_range, max_duration_seconds=max_group_dur
-        ):
-            await _safe_edit(status_msg, dur_err)
-            return
+            caption = f"{badge} <b>{html.escape(title)}</b>"
+            if validated_range:
+                caption += f"\n✂️ <code>{validated_range.label()}</code>"
+            if len(caption) > 1000:
+                caption = caption[:997] + "..."
 
-        if max_group_bytes > 0 and media.size_bytes > max_group_bytes:
-            await _safe_edit(
-                status_msg,
-                f"📦 Видео ({format_filesize(media.size_bytes)}) превышает лимит для групповых чатов "
-                f"({format_filesize(max_group_bytes)}). Отправь ссылку мне в личку.",
+            tg_filename = sanitize_telegram_filename(title, media.file_path.suffix)
+            await bot.send_chat_action(chat_id=message.chat.id, action=ChatAction.UPLOAD_VIDEO)
+            sent_msg = await message.reply_video(
+                video=FSInputFile(media.file_path, filename=tg_filename),
+                width=media.width,
+                height=media.height,
+                duration=media.duration,
+                supports_streaming=True,
+                caption=caption,
+                parse_mode="HTML",
             )
-            return
-
-        caption = f"{badge} <b>{html.escape(title)}</b>"
-        if validated_range:
-            caption += f"\n✂️ <code>{validated_range.label()}</code>"
-        if len(caption) > 1000:
-            caption = caption[:997] + "..."
-
-        tg_filename = sanitize_telegram_filename(title, media.file_path.suffix)
-        await bot.send_chat_action(chat_id=message.chat.id, action=ChatAction.UPLOAD_VIDEO)
-        sent_msg = await message.reply_video(
-            video=FSInputFile(media.file_path, filename=tg_filename),
-            width=media.width,
-            height=media.height,
-            duration=media.duration,
-            supports_streaming=True,
-            caption=caption,
-            parse_mode="HTML",
-        )
-        _save_to_cache(
-            media_cache,
-            cache_key=cache_key,
-            sent_msg=sent_msg,
-            media=media,
-            title=title,
-            uploader=uploader,
-            send_as_document=False,
-        )
-        try:
-            await status_msg.delete()
-        except TelegramBadRequest:
-            pass
+            _save_to_cache(
+                media_cache,
+                cache_key=cache_key,
+                sent_msg=sent_msg,
+                media=media,
+                title=title,
+                uploader=uploader,
+                send_as_document=False,
+            )
+            try:
+                await status_msg.delete()
+            except TelegramBadRequest:
+                pass
     except QueueError as exc:
         await _safe_edit(status_msg, html.escape(str(exc)))
     except AuthRequiredError:
@@ -753,6 +765,9 @@ async def handle_group_shorts(
             f"❌ Не удалось скачать {label}:\n<code>{html.escape(str(exc)[:300])}</code>",
         )
     except asyncio.CancelledError:
+        if _clear_user_cancel_flag(active_task):
+            await _safe_edit(status_msg, f"🛑 Скачивание {label} остановлено.")
+            return
         raise
     except Exception as exc:
         logger.exception("Unexpected error in handle_group_shorts: %s", exc)
@@ -765,14 +780,26 @@ async def handle_group_shorts(
             media.cleanup()
 
 
+def _clear_user_cancel_flag(active_task: ActiveDownloadTask | None) -> bool:
+    """Return True if cancelled by user /stop, resetting pending Task.cancel counters."""
+    if active_task is None or not active_task.cancelled_by_user:
+        return False
+    cur = asyncio.current_task()
+    if cur is not None:
+        while cur.cancelling():
+            cur.uncancel()
+    return True
+
+
 async def _fetch_in_queue(
     *,
     job_store: PendingJobStore,
+    user_id: int,
     status_msg: Message,
     fetch_coro_factory: Callable[[], Awaitable[VideoInfo]],
     active_text: str,
     settings: Settings | None = None,
-) -> VideoInfo:
+) -> VideoInfo | None:
     """Serialize metadata lookup through the global FIFO queue with position feedback."""
     fetch_timeout = float(settings.fetch_info_timeout_seconds) if settings else 45.0
     queued = False
@@ -782,14 +809,26 @@ async def _fetch_in_queue(
         queued = True
         await _safe_edit(status_msg, f"🚦 В очереди на получение данных (#{pos})...")
 
-    async with job_store.queue.slot(
-        on_queued=_on_queued,
-        task_timeout=fetch_timeout,
-        task_timeout_message=f"⏳ Превышено время получения данных о видео ({int(fetch_timeout)} сек.).",
-    ):
-        if queued:
-            await _safe_edit(status_msg, active_text)
-        return await fetch_coro_factory()
+    active_task: ActiveDownloadTask | None = None
+    try:
+        async with job_store.track_active_task(
+            user_id=user_id,
+            chat_id=status_msg.chat.id,
+            description="fetch_info",
+        ) as active_task:
+            async with job_store.queue.slot(
+                on_queued=_on_queued,
+                task_timeout=fetch_timeout,
+                task_timeout_message=f"⏳ Превышено время получения данных о видео ({int(fetch_timeout)} сек.).",
+            ):
+                if queued:
+                    await _safe_edit(status_msg, active_text)
+                return await fetch_coro_factory()
+    except asyncio.CancelledError:
+        if _clear_user_cancel_flag(active_task):
+            await _safe_edit(status_msg, "🛑 Получение данных остановлено.")
+            return None
+        raise
 
 
 @router.message(
@@ -817,6 +856,7 @@ async def handle_youtube_link(
     try:
         info = await _fetch_in_queue(
             job_store=job_store,
+            user_id=message.from_user.id,
             status_msg=status_msg,
             active_text="🔍 Получаю информацию о видео...",
             settings=settings,
@@ -825,6 +865,8 @@ async def handle_youtube_link(
                 is_shorts=parsed.video.is_shorts,
             ),
         )
+        if info is None:
+            return
     except QueueError as exc:
         await _safe_edit(status_msg, html.escape(str(exc)))
         return
@@ -901,6 +943,7 @@ async def handle_instagram_link(
     try:
         info = await _fetch_in_queue(
             job_store=job_store,
+            user_id=message.from_user.id,
             status_msg=status_msg,
             active_text="🔍 Получаю данные Instagram Reels...",
             settings=settings,
@@ -910,6 +953,8 @@ async def handle_instagram_link(
                 canonical_url=parsed.media.canonical_url,
             ),
         )
+        if info is None:
+            return
     except QueueError as exc:
         await _safe_edit(status_msg, html.escape(str(exc)))
         return
@@ -954,6 +999,7 @@ async def handle_tiktok_link(
     try:
         info = await _fetch_in_queue(
             job_store=job_store,
+            user_id=message.from_user.id,
             status_msg=status_msg,
             active_text="🔍 Получаю информацию о TikTok...",
             settings=settings,
@@ -961,6 +1007,8 @@ async def handle_tiktok_link(
                 parsed.media.canonical_url
             ),
         )
+        if info is None:
+            return
     except QueueError as exc:
         await _safe_edit(status_msg, html.escape(str(exc)))
         return
@@ -1250,102 +1298,108 @@ async def cb_download(
         await _safe_edit(status_msg, f"{header}\n\n🚦 В очереди на скачивание (#{pos})...")
 
     media = None
+    active_task: ActiveDownloadTask | None = None
     try:
-        async with job_store.queue.slot(
-            on_queued=_on_dl_queued,
-            task_timeout=dl_timeout,
-            task_timeout_message=(
-                f"⏳ Скачивание заняло дольше {int(dl_timeout)} сек. и было остановлено. "
-                "Попробуй качество пониже или короткий отрезок."
-            ),
-        ):
-            await _safe_edit(status_msg, f"{header}\n\n⬇️ Начинаю скачивание...")
-            should_compress = not send_as_document and download_quality != "audio"
-            if job.platform == "instagram":
-                media = await ig_downloader.download(
-                    shortcode=job.info.video_id,
-                    kind=job.ig_kind,
-                    canonical_url=job.info.webpage_url,
-                    quality=download_quality,
-                    time_range=job.time_range,
-                    compress=should_compress,
-                    on_stage=_on_stage,
+        async with job_store.track_active_task(
+            user_id=callback.from_user.id,
+            chat_id=job.chat_id,
+            description=job.info.title,
+        ) as active_task:
+            async with job_store.queue.slot(
+                on_queued=_on_dl_queued,
+                task_timeout=dl_timeout,
+                task_timeout_message=(
+                    f"⏳ Скачивание заняло дольше {int(dl_timeout)} сек. и было остановлено. "
+                    "Попробуй качество пониже или короткий отрезок."
+                ),
+            ):
+                await _safe_edit(status_msg, f"{header}\n\n⬇️ Начинаю скачивание...")
+                should_compress = not send_as_document and download_quality != "audio"
+                if job.platform == "instagram":
+                    media = await ig_downloader.download(
+                        shortcode=job.info.video_id,
+                        kind=job.ig_kind,
+                        canonical_url=job.info.webpage_url,
+                        quality=download_quality,
+                        time_range=job.time_range,
+                        compress=should_compress,
+                        on_stage=_on_stage,
+                    )
+                elif job.platform == "tiktok":
+                    media = await tiktok_downloader.download(
+                        job.info.webpage_url,
+                        quality=download_quality,
+                        is_portrait=job.info.is_portrait,
+                        time_range=job.time_range,
+                        compress=should_compress,
+                        on_progress=_on_progress,
+                        on_stage=_on_stage,
+                    )
+                else:
+                    media = await downloader.download(
+                        job.info.webpage_url,
+                        quality=download_quality,
+                        is_portrait=job.info.is_portrait,
+                        time_range=job.time_range,
+                        compress=should_compress,
+                        on_progress=_on_progress,
+                        on_stage=_on_stage,
+                    )
+
+            await _safe_edit(
+                status_msg,
+                f"{header}\n\n📤 Отправляю в Telegram ({format_filesize(media.size_bytes)})...",
+            )
+
+            tg_filename = sanitize_telegram_filename(job.info.title, media.file_path.suffix)
+            input_file = FSInputFile(media.file_path, filename=tg_filename)
+            if send_as_document:
+                await bot.send_chat_action(chat_id=job.chat_id, action=ChatAction.UPLOAD_DOCUMENT)
+                sent_msg = await bot.send_document(
+                    chat_id=job.chat_id,
+                    document=input_file,
+                    caption=caption,
+                    parse_mode="HTML",
+                    disable_content_type_detection=True,
                 )
-            elif job.platform == "tiktok":
-                media = await tiktok_downloader.download(
-                    job.info.webpage_url,
-                    quality=download_quality,
-                    is_portrait=job.info.is_portrait,
-                    time_range=job.time_range,
-                    compress=should_compress,
-                    on_progress=_on_progress,
-                    on_stage=_on_stage,
+            elif media.is_audio:
+                await bot.send_chat_action(chat_id=job.chat_id, action=ChatAction.UPLOAD_DOCUMENT)
+                sent_msg = await bot.send_audio(
+                    chat_id=job.chat_id,
+                    audio=input_file,
+                    title=job.info.title,
+                    performer=job.info.uploader,
+                    duration=media.duration,
+                    caption=caption,
+                    parse_mode="HTML",
                 )
             else:
-                media = await downloader.download(
-                    job.info.webpage_url,
-                    quality=download_quality,
-                    is_portrait=job.info.is_portrait,
-                    time_range=job.time_range,
-                    compress=should_compress,
-                    on_progress=_on_progress,
-                    on_stage=_on_stage,
+                await bot.send_chat_action(chat_id=job.chat_id, action=ChatAction.UPLOAD_VIDEO)
+                sent_msg = await bot.send_video(
+                    chat_id=job.chat_id,
+                    video=input_file,
+                    width=media.width,
+                    height=media.height,
+                    duration=media.duration,
+                    supports_streaming=True,
+                    caption=caption,
+                    parse_mode="HTML",
                 )
 
-        await _safe_edit(
-            status_msg,
-            f"{header}\n\n📤 Отправляю в Telegram ({format_filesize(media.size_bytes)})...",
-        )
-
-        tg_filename = sanitize_telegram_filename(job.info.title, media.file_path.suffix)
-        input_file = FSInputFile(media.file_path, filename=tg_filename)
-        if send_as_document:
-            await bot.send_chat_action(chat_id=job.chat_id, action=ChatAction.UPLOAD_DOCUMENT)
-            sent_msg = await bot.send_document(
-                chat_id=job.chat_id,
-                document=input_file,
-                caption=caption,
-                parse_mode="HTML",
-                disable_content_type_detection=True,
-            )
-        elif media.is_audio:
-            await bot.send_chat_action(chat_id=job.chat_id, action=ChatAction.UPLOAD_DOCUMENT)
-            sent_msg = await bot.send_audio(
-                chat_id=job.chat_id,
-                audio=input_file,
+            _save_to_cache(
+                media_cache,
+                cache_key=cache_key,
+                sent_msg=sent_msg,
+                media=media,
                 title=job.info.title,
-                performer=job.info.uploader,
-                duration=media.duration,
-                caption=caption,
-                parse_mode="HTML",
-            )
-        else:
-            await bot.send_chat_action(chat_id=job.chat_id, action=ChatAction.UPLOAD_VIDEO)
-            sent_msg = await bot.send_video(
-                chat_id=job.chat_id,
-                video=input_file,
-                width=media.width,
-                height=media.height,
-                duration=media.duration,
-                supports_streaming=True,
-                caption=caption,
-                parse_mode="HTML",
+                uploader=job.info.uploader,
+                send_as_document=send_as_document,
             )
 
-        _save_to_cache(
-            media_cache,
-            cache_key=cache_key,
-            sent_msg=sent_msg,
-            media=media,
-            title=job.info.title,
-            uploader=job.info.uploader,
-            send_as_document=send_as_document,
-        )
-
-        try:
-            await status_msg.delete()
-        except TelegramBadRequest:
-            pass
+            try:
+                await status_msg.delete()
+            except TelegramBadRequest:
+                pass
 
     except QueueError as exc:
         await _safe_edit(status_msg, f"{header}\n\n{html.escape(str(exc))}")
@@ -1368,6 +1422,9 @@ async def cb_download(
             f"{header}\n\n❌ Ошибка скачивания:\n<code>{html.escape(str(exc)[:500])}</code>",
         )
     except asyncio.CancelledError:
+        if _clear_user_cancel_flag(active_task):
+            await _safe_edit(status_msg, f"{header}\n\n🛑 Скачивание остановлено.")
+            return
         raise
     except Exception as exc:
         logger.exception("Unexpected error during download/upload: %s", exc)

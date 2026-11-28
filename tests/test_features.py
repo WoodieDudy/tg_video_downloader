@@ -9,7 +9,7 @@ from aiogram.enums import ChatType
 from aiogram.types import CallbackQuery, Chat, ChatMemberUpdated, Message, MessageEntity, User
 
 from bot.config import Settings
-from bot.handlers.commands import cmd_start, cmd_status, on_added_to_group
+from bot.handlers.commands import cmd_start, cmd_status, cmd_stop, on_added_to_group
 from bot.handlers.youtube import (
     _has_supported_media_url,
     _is_group_auto_media,
@@ -312,6 +312,7 @@ async def test_separate_help_for_private_and_group(tmp_path: Path) -> None:
     assert "личных сообщениях" in user_help
     assert "Админ-команды" not in user_help
     assert "/status" not in user_help
+    assert "/stop" in user_help
     assert "/cancel" in user_help
 
 
@@ -609,3 +610,116 @@ async def test_status_is_admin_only(tmp_path: Path) -> None:
     admin_msg.answer.assert_awaited_once()
     assert "Статус бота" in admin_msg.answer.call_args.args[0]
     assert "Общая очередь" in admin_msg.answer.call_args.args[0]
+
+
+async def test_stop_command_cancels_active_download_and_releases_queue(tmp_path: Path) -> None:
+    access = AccessManager(tmp_path / "users.json", admin_ids={100}, seed_allowed_ids={200})
+    cache = MediaCache(tmp_path / "cache.json")
+    job_store = PendingJobStore(max_concurrent_downloads=1, queue_task_gap_seconds=0.0)
+
+    info = VideoInfo(
+        video_id="vid_stop",
+        title="Long 4K Video",
+        uploader="Creator",
+        duration=600,
+        webpage_url="https://www.youtube.com/watch?v=vid_stop",
+        is_shorts=False,
+        is_portrait=False,
+        is_live=False,
+        available_heights=[2160],
+        estimated_sizes={2160: 500_000_000},
+    )
+    job = job_store.create(user_id=200, chat_id=200, info=info, platform="youtube")
+
+    status_msg = MagicMock(spec=Message)
+    status_msg.edit_text = AsyncMock()
+    status_msg.delete = AsyncMock()
+
+    callback = MagicMock(spec=CallbackQuery)
+    callback.data = f"dl:{job.job_id}:2160"
+    callback.from_user = MagicMock(spec=User, id=200)
+    callback.message = status_msg
+    callback.answer = AsyncMock()
+
+    state = MagicMock()
+    state.clear = AsyncMock()
+
+    download_started = asyncio.Event()
+
+    async def _slow_download(*args, **kwargs):
+        download_started.set()
+        await asyncio.sleep(10)
+
+    downloader = MagicMock()
+    downloader.download = AsyncMock(side_effect=_slow_download)
+
+    dl_task = asyncio.create_task(
+        cb_download(
+            callback=callback,
+            state=state,
+            bot=MagicMock(),
+            downloader=downloader,
+            ig_downloader=MagicMock(),
+            tiktok_downloader=MagicMock(),
+            media_cache=cache,
+            job_store=job_store,
+        )
+    )
+    await download_started.wait()
+    assert job_store.queue.active_count == 1
+    assert job_store.active_tasks_count == 1
+
+    # Another non-admin user cannot stop user 200's download
+    other_stop = MagicMock(spec=Message)
+    other_stop.chat = MagicMock(spec=Chat, id=300, type=ChatType.PRIVATE)
+    other_stop.from_user = MagicMock(spec=User, id=300)
+    other_stop.answer = AsyncMock()
+    await cmd_stop(other_stop, SimpleNamespace(args=None), access, job_store)
+    assert "Активных скачиваний сейчас нет" in other_stop.answer.call_args.args[0]
+    assert not dl_task.done()
+
+    # User 200 sends /stop in PM -> active download cancels cleanly & queue releases
+    stop_msg = MagicMock(spec=Message)
+    stop_msg.chat = MagicMock(spec=Chat, id=200, type=ChatType.PRIVATE)
+    stop_msg.from_user = MagicMock(spec=User, id=200)
+    stop_msg.answer = AsyncMock()
+
+    await cmd_stop(stop_msg, SimpleNamespace(args=None), access, job_store)
+    assert "Останавливаю" in stop_msg.answer.call_args.args[0]
+
+    await dl_task
+    assert job_store.queue.active_count == 0
+    assert job_store.active_tasks_count == 0
+    assert "остановлено" in status_msg.edit_text.call_args_list[-1].args[0].lower()
+
+    # Admin /stop all also cancels another user's running task
+    job2 = job_store.create(user_id=200, chat_id=200, info=info, platform="youtube")
+    callback2 = MagicMock(spec=CallbackQuery)
+    callback2.data = f"dl:{job2.job_id}:2160"
+    callback2.from_user = MagicMock(spec=User, id=200)
+    callback2.message = status_msg
+    callback2.answer = AsyncMock()
+
+    download_started.clear()
+    dl_task2 = asyncio.create_task(
+        cb_download(
+            callback=callback2,
+            state=state,
+            bot=MagicMock(),
+            downloader=downloader,
+            ig_downloader=MagicMock(),
+            tiktok_downloader=MagicMock(),
+            media_cache=cache,
+            job_store=job_store,
+        )
+    )
+    await download_started.wait()
+
+    admin_stop = MagicMock(spec=Message)
+    admin_stop.chat = MagicMock(spec=Chat, id=100, type=ChatType.PRIVATE)
+    admin_stop.from_user = MagicMock(spec=User, id=100)
+    admin_stop.answer = AsyncMock()
+    await cmd_stop(admin_stop, SimpleNamespace(args="all"), access, job_store)
+    assert "Остановлено задач" in admin_stop.answer.call_args.args[0]
+    await dl_task2
+    assert job_store.queue.active_count == 0

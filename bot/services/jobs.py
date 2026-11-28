@@ -7,6 +7,7 @@ from collections import defaultdict, deque
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
+from typing import Any
 
 from bot.services.downloader import VideoInfo
 from bot.utils.parsers import TimeRange
@@ -200,6 +201,18 @@ class GlobalRequestQueue:
             self.release()
 
 
+@dataclass(slots=True)
+class ActiveDownloadTask:
+    """Running or queued fetch/download asyncio task that can be stopped by user command."""
+
+    task_id: str
+    user_id: int
+    chat_id: int
+    task: asyncio.Task[Any]
+    description: str = ""
+    cancelled_by_user: bool = False
+
+
 class PendingJobStore:
     """In-memory store of pending download requests with automatic TTL expiration."""
 
@@ -213,6 +226,7 @@ class PendingJobStore:
         queue_task_gap_seconds: float = 2.0,
     ) -> None:
         self._jobs: dict[str, PendingJob] = {}
+        self._active_tasks: dict[str, ActiveDownloadTask] = {}
         self._ttl_seconds = ttl_seconds
         self.queue = GlobalRequestQueue(
             max_concurrent=max_concurrent_downloads,
@@ -220,6 +234,63 @@ class PendingJobStore:
             wait_timeout_seconds=queue_wait_timeout_seconds,
             min_gap_seconds=queue_task_gap_seconds,
         )
+
+    @property
+    def active_tasks_count(self) -> int:
+        return sum(1 for item in self._active_tasks.values() if not item.task.done())
+
+    @asynccontextmanager
+    async def track_active_task(
+        self,
+        *,
+        user_id: int,
+        chat_id: int,
+        description: str = "",
+    ) -> AsyncIterator[ActiveDownloadTask | None]:
+        current = asyncio.current_task()
+        if current is None:
+            yield None
+            return
+
+        task_id = secrets.token_hex(6)
+        entry = ActiveDownloadTask(
+            task_id=task_id,
+            user_id=user_id,
+            chat_id=chat_id,
+            task=current,
+            description=description,
+        )
+        self._active_tasks[task_id] = entry
+        try:
+            yield entry
+        finally:
+            self._active_tasks.pop(task_id, None)
+
+    def cancel_user_tasks(self, user_id: int, *, chat_id: int | None = None) -> int:
+        """Cancel active or queued tasks belonging to user_id (optionally scoped to chat_id)."""
+        cancelled = 0
+        for entry in list(self._active_tasks.values()):
+            if entry.user_id != user_id:
+                continue
+            if chat_id is not None and entry.chat_id != chat_id:
+                continue
+            if entry.task.done():
+                continue
+            entry.cancelled_by_user = True
+            if entry.task.cancel():
+                cancelled += 1
+        return cancelled
+
+    def cancel_all_tasks(self) -> int:
+        """Cancel all active or queued tasks across all users (admin override)."""
+        cancelled = 0
+        for entry in list(self._active_tasks.values()):
+            if entry.task.done():
+                continue
+            entry.cancelled_by_user = True
+            if entry.task.cancel():
+                cancelled += 1
+        return cancelled
 
     def create(
         self,

@@ -155,12 +155,14 @@ def _build_private_help(*, is_admin: bool) -> str:
         "  <code>https://youtu.be/... 01:15-02:30</code>\n"
         "  или нажми кнопку <b>✂️ Обрезать</b>.\n\n"
         "<b>Команды:</b>\n"
+        "/stop — остановить текущее скачивание\n"
         "/cancel — отменить ввод таймкода"
     )
     if is_admin:
         text += (
             "\n\n<b>Админ-команды:</b>\n"
             "/status — статус headless Chrome, сессии Google, кэша, очереди и диска\n"
+            "/stop all — принудительно остановить текущие задачи в общей очереди\n"
             "/refresh_cookies — обновить cookies из Chrome\n"
             "/clear_cache — очистить кэш Telegram file_id\n"
             "/add @username — разрешить доступ пользователю по @username или ID\n"
@@ -205,6 +207,40 @@ async def cmd_cancel(message: Message, state: FSMContext) -> None:
         await message.answer("Ок, ввод таймкода отменён.")
     else:
         await message.answer("Активных действий для отмены нет.")
+
+
+@router.message(Command("stop"), F.chat.type == ChatType.PRIVATE)
+async def cmd_stop(
+    message: Message,
+    command: CommandObject,
+    access_manager: AccessManager,
+    job_store: PendingJobStore,
+) -> None:
+    if not message.from_user:
+        return
+
+    is_admin = access_manager.is_admin(message.from_user.id)
+    arg = (command.args or "").strip().lower()
+
+    if is_admin and arg == "all":
+        stopped = job_store.cancel_all_tasks()
+        if stopped:
+            await message.answer(f"🛑 Остановлено задач: <b>{stopped}</b>.", parse_mode="HTML")
+        else:
+            await message.answer("Активных скачиваний сейчас нет.")
+        return
+
+    stopped = job_store.cancel_user_tasks(message.from_user.id, chat_id=message.chat.id)
+    if stopped:
+        await message.answer("🛑 Останавливаю текущее скачивание...")
+    elif is_admin and job_store.active_tasks_count > 0:
+        await message.answer(
+            "У тебя сейчас нет активного скачивания, но в общей очереди есть активная задача.\n"
+            "Чтобы остановить её принудительно: <code>/stop all</code>.",
+            parse_mode="HTML",
+        )
+    else:
+        await message.answer("Активных скачиваний сейчас нет.")
 
 
 @router.message(Command("status"))
