@@ -9,7 +9,7 @@ from aiogram.enums import ChatType
 from aiogram.types import CallbackQuery, Chat, ChatMemberUpdated, Message, MessageEntity, User
 
 from bot.config import Settings
-from bot.handlers.commands import cmd_start, cmd_status, cmd_stop, on_added_to_group
+from bot.handlers.commands import cmd_start, cmd_stats, cmd_status, cmd_stop, on_added_to_group
 from bot.handlers.youtube import (
     _has_supported_media_url,
     _is_group_auto_media,
@@ -32,6 +32,7 @@ from bot.services.jobs import (
     RateLimiter,
     TaskTimeoutError,
 )
+from bot.services.stats import StatsTracker
 from bot.services.tiktok import parse_tikwm_payload
 from bot.utils.parsers import TimeRange, extract_tiktok_url, parse_tiktok_request
 
@@ -723,3 +724,53 @@ async def test_stop_command_cancels_active_download_and_releases_queue(tmp_path:
     assert "Остановлено задач" in admin_stop.answer.call_args.args[0]
     await dl_task2
     assert job_store.queue.active_count == 0
+
+
+async def test_stats_tracker_and_admin_only_cmd_stats(tmp_path: Path) -> None:
+    stats_file = tmp_path / "stats.json"
+    access = AccessManager(tmp_path / "users.json", admin_ids={100}, seed_allowed_ids={200, 300})
+    tracker = StatsTracker(stats_file)
+
+    # Admin downloads must be excluded from non-admin summary
+    tracker.record_download(user_id=100, username="admin_user", platform="youtube", from_cache=False)
+    tracker.record_download(user_id=200, username="alice", platform="youtube", from_cache=False)
+    tracker.record_download(user_id=200, username="alice", platform="tiktok", from_cache=True)
+    tracker.record_download(user_id=300, username=None, platform="instagram", from_cache=False)
+
+    # Reload from disk to verify JSON persistence
+    reloaded = StatsTracker(stats_file)
+    summary = reloaded.summarize_non_admins(access.admin_ids, known_usernames=access.allowed_ids)
+    assert summary.total_downloads == 3
+    assert summary.fresh_downloads == 2
+    assert summary.cache_downloads == 1
+    assert summary.unique_users == 2
+    assert summary.by_platform == {"youtube": 1, "tiktok": 1, "instagram": 1}
+
+    # Non-admin denied
+    user_msg = MagicMock(spec=Message)
+    user_msg.chat = MagicMock(spec=Chat, id=200, type=ChatType.PRIVATE)
+    user_msg.from_user = MagicMock(spec=User, id=200)
+    user_msg.answer = AsyncMock()
+    await cmd_stats(user_msg, access, reloaded)
+    assert "только администратору" in user_msg.answer.call_args.args[0]
+
+    # Admin in group chat gets PM-only notice (does not leak user stats into group)
+    group_admin_msg = MagicMock(spec=Message)
+    group_admin_msg.chat = MagicMock(spec=Chat, id=-100555, type=ChatType.SUPERGROUP)
+    group_admin_msg.from_user = MagicMock(spec=User, id=100)
+    group_admin_msg.answer = AsyncMock()
+    await cmd_stats(group_admin_msg, access, reloaded)
+    assert "личных сообщениях" in group_admin_msg.answer.call_args.args[0]
+
+    # Admin in PM gets full non-admin stats without admin user
+    pm_admin_msg = MagicMock(spec=Message)
+    pm_admin_msg.chat = MagicMock(spec=Chat, id=100, type=ChatType.PRIVATE)
+    pm_admin_msg.from_user = MagicMock(spec=User, id=100)
+    pm_admin_msg.answer = AsyncMock()
+    await cmd_stats(pm_admin_msg, access, reloaded)
+    text = pm_admin_msg.answer.call_args.args[0]
+    assert "Всего загрузок:</b> 3" in text
+    assert "@alice" in text
+    assert "300" in text
+    assert "admin_user" not in text
+    assert "100" not in text

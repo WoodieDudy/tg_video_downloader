@@ -36,6 +36,7 @@ services:
       DOWNLOADS_DIR: /data/downloads
       USERS_FILE: /data/state/users.json
       CACHE_FILE: /data/state/media_cache.json
+      STATS_FILE: /data/state/stats.json
     shm_size: "1gb"
     volumes:
       - chrome_profile:/data/chrome-profile

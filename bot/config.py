@@ -61,6 +61,7 @@ class Settings(BaseSettings):
     downloads_dir: Path = Path("/data/downloads")
     users_file: Path = Path("/data/state/users.json")
     cache_file: Path = Path("/data/state/media_cache.json")
+    stats_file: Path = Path("/data/state/stats.json")
 
     cookie_refresh_interval_minutes: int = 240
     low_disk_warn_gb: float = 3.0

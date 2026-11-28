@@ -42,6 +42,7 @@ from bot.services.jobs import (
     QueueError,
     RateLimiter,
 )
+from bot.services.stats import StatsTracker
 from bot.services.tiktok import TikTokDownloader
 from bot.utils.parsers import (
     TimeRange,
@@ -394,6 +395,8 @@ async def _try_group_cache_hit(
     cache_key: str,
     badge: str,
     time_range: TimeRange | None,
+    stats_tracker: StatsTracker | None = None,
+    platform: str = "youtube",
 ) -> bool:
     cached = media_cache.get(cache_key)
     if cached is None:
@@ -409,6 +412,13 @@ async def _try_group_cache_hit(
         caption=caption[:1000],
         reply_to_message=message,
     ):
+        if stats_tracker is not None and message.from_user:
+            stats_tracker.record_download(
+                user_id=message.from_user.id,
+                username=message.from_user.username,
+                platform=platform,
+                from_cache=True,
+            )
         try:
             await status_msg.delete()
         except TelegramBadRequest:
@@ -464,6 +474,7 @@ async def handle_group_shorts(
     settings: Settings | None = None,
     access_manager: AccessManager | None = None,
     rate_limiter: RateLimiter | None = None,
+    stats_tracker: StatsTracker | None = None,
 ) -> None:
     """Download media in authorized group chats (/dl, reply-to-bot, @mention, or auto Shorts/Reels/TikTok)."""
     own_text = _get_message_text(message)
@@ -577,6 +588,8 @@ async def handle_group_shorts(
                         cache_key=cache_key,
                         badge=badge,
                         time_range=validated_range,
+                        stats_tracker=stats_tracker,
+                        platform=platform,
                     ):
                         return
 
@@ -624,6 +637,8 @@ async def handle_group_shorts(
                         cache_key=cache_key,
                         badge=badge,
                         time_range=validated_range,
+                        stats_tracker=stats_tracker,
+                        platform=platform,
                     ):
                         return
 
@@ -676,6 +691,8 @@ async def handle_group_shorts(
                         cache_key=cache_key,
                         badge=badge,
                         time_range=validated_range,
+                        stats_tracker=stats_tracker,
+                        platform=platform,
                     ):
                         return
 
@@ -746,6 +763,13 @@ async def handle_group_shorts(
                 uploader=uploader,
                 send_as_document=False,
             )
+            if stats_tracker is not None and sender_id:
+                stats_tracker.record_download(
+                    user_id=sender_id,
+                    username=getattr(message.from_user, "username", None),
+                    platform=platform,
+                    from_cache=False,
+                )
             try:
                 await status_msg.delete()
             except TelegramBadRequest:
@@ -1194,6 +1218,7 @@ async def cb_download(
     access_manager: AccessManager | None = None,
     rate_limiter: RateLimiter | None = None,
     settings: Settings | None = None,
+    stats_tracker: StatsTracker | None = None,
 ) -> None:
     parts = (callback.data or "").split(":")
     if len(parts) != 3:
@@ -1278,6 +1303,13 @@ async def cb_download(
             cached=cached,
             caption=caption,
         ):
+            if stats_tracker is not None:
+                stats_tracker.record_download(
+                    user_id=callback.from_user.id,
+                    username=callback.from_user.username,
+                    platform=job.platform,
+                    from_cache=True,
+                )
             try:
                 await status_msg.delete()
             except TelegramBadRequest:
@@ -1395,6 +1427,13 @@ async def cb_download(
                 uploader=job.info.uploader,
                 send_as_document=send_as_document,
             )
+            if stats_tracker is not None:
+                stats_tracker.record_download(
+                    user_id=callback.from_user.id,
+                    username=callback.from_user.username,
+                    platform=job.platform,
+                    from_cache=False,
+                )
 
             try:
                 await status_msg.delete()

@@ -16,6 +16,7 @@ from bot.services.access import AccessManager
 from bot.services.cache import MediaCache
 from bot.services.chrome_cookies import ChromeSessionManager, SessionStatus
 from bot.services.jobs import PendingJobStore
+from bot.services.stats import NonAdminStatsSummary, StatsTracker
 from bot.utils.parsers import format_filesize
 
 logger = logging.getLogger(__name__)
@@ -162,6 +163,7 @@ def _build_private_help(*, is_admin: bool) -> str:
         text += (
             "\n\n<b>Админ-команды:</b>\n"
             "/status — статус headless Chrome, сессии Google, кэша, очереди и диска\n"
+            "/stats — статистика загрузок других пользователей (кроме админов)\n"
             "/stop all — принудительно остановить текущие задачи в общей очереди\n"
             "/refresh_cookies — обновить cookies из Chrome\n"
             "/clear_cache — очистить кэш Telegram file_id\n"
@@ -260,6 +262,68 @@ async def cmd_status(
         _format_status(cookie_manager.status, settings, media_cache, job_store),
         parse_mode="HTML",
     )
+
+
+def _format_non_admin_stats(summary: NonAdminStatsSummary) -> str:
+    if summary.total_downloads == 0:
+        return "📊 Пока не было ни одной загрузки от других пользователей (кроме админов)."
+
+    platform_labels = {
+        "youtube": "YouTube",
+        "instagram": "Instagram",
+        "tiktok": "TikTok",
+    }
+    plat_parts = [
+        f"{platform_labels.get(k, html.escape(k))}: {v}"
+        for k, v in sorted(summary.by_platform.items(), key=lambda kv: (-kv[1], kv[0]))
+    ]
+    lines = [
+        "📊 <b>Статистика загрузок (кроме админов)</b>",
+        "",
+        f"📥 <b>Всего загрузок:</b> {summary.total_downloads} "
+        f"(новых: {summary.fresh_downloads}, из кэша: {summary.cache_downloads})",
+        f"👥 <b>Пользователей:</b> {summary.unique_users}",
+    ]
+    if plat_parts:
+        lines.append(f"🎬 <b>По платформам:</b> {' • '.join(plat_parts)}")
+
+    lines.append("")
+    lines.append("<b>По пользователям:</b>")
+    limit = 25
+    for entry in summary.users[:limit]:
+        who = (
+            f"@{html.escape(entry.username)} (<code>{entry.user_id}</code>)"
+            if entry.username
+            else f"<code>{entry.user_id}</code>"
+        )
+        lines.append(
+            f"• {who}: <b>{entry.total_count}</b> "
+            f"(новых: {entry.fresh_count}, кэш: {entry.cache_count})"
+        )
+    if len(summary.users) > limit:
+        lines.append(f"… и ещё {len(summary.users) - limit} пользователей")
+    return "\n".join(lines)
+
+
+@router.message(Command("stats"))
+async def cmd_stats(
+    message: Message,
+    access_manager: AccessManager,
+    stats_tracker: StatsTracker,
+) -> None:
+    if not message.from_user or not access_manager.is_admin(message.from_user.id):
+        await message.answer("⛔ Команда доступна только администратору.")
+        return
+
+    if message.chat.type != ChatType.PRIVATE:
+        await message.answer("📊 Статистика доступна только в личных сообщениях с ботом.")
+        return
+
+    summary = stats_tracker.summarize_non_admins(
+        access_manager.admin_ids,
+        known_usernames=access_manager.allowed_ids,
+    )
+    await message.answer(_format_non_admin_stats(summary), parse_mode="HTML")
 
 
 @router.message(Command("clear_cache"))

@@ -29,6 +29,7 @@ from bot.services.chrome_cookies import ChromeSessionManager
 from bot.services.downloader import YouTubeDownloader
 from bot.services.instagram import InstagramDownloader
 from bot.services.jobs import PendingJobStore, RateLimiter
+from bot.services.stats import StatsTracker
 from bot.services.tiktok import TikTokDownloader
 
 logger = logging.getLogger(__name__)
@@ -117,6 +118,7 @@ async def register_commands(bot: Bot, admin_ids: set[int] | None = None) -> None
                     [
                         BotCommand(command="dl", description="Скачать видео / Shorts / Reels / TikTok"),
                         BotCommand(command="status", description="Статус бота и Chrome-сессии"),
+                        BotCommand(command="stats", description="Статистика загрузок пользователей"),
                         BotCommand(command="stop", description="Остановить текущее скачивание"),
                         BotCommand(command="cancel", description="Отменить ввод таймкода"),
                         BotCommand(command="help", description="Справка"),
@@ -137,6 +139,7 @@ async def run() -> None:
     settings.cookies_file.parent.mkdir(parents=True, exist_ok=True)
     settings.users_file.parent.mkdir(parents=True, exist_ok=True)
     settings.cache_file.parent.mkdir(parents=True, exist_ok=True)
+    settings.stats_file.parent.mkdir(parents=True, exist_ok=True)
 
     access_manager = AccessManager(
         settings.users_file,
@@ -145,6 +148,7 @@ async def run() -> None:
         seed_allowed_ids=settings.allowed_user_ids,
     )
     media_cache = MediaCache(settings.cache_file)
+    stats_tracker = StatsTracker(settings.stats_file)
     bot = build_bot(settings)
     alert_monitor = AdminAlertMonitor(
         bot,
@@ -217,6 +221,7 @@ async def run() -> None:
     dp["tiktok_downloader"] = tiktok_downloader
     dp["job_store"] = job_store
     dp["rate_limiter"] = rate_limiter
+    dp["stats_tracker"] = stats_tracker
 
     await cookie_manager.start()
     try:
